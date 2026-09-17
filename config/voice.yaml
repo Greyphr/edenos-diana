@@ -1,5 +1,5 @@
 provider: gemini_live
-voice_name: Sulafat
+voice_name: Puck
 language_code: en-US
 personality:
   accent: neutral

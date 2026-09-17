@@ -22,7 +22,7 @@ class AudioIO:
     def set_engaged(self, engaged: bool):
         self._engaged = engaged
 
-    def start_mic(
+    async def start_mic(
         self, wake_detector, on_wake, on_forward_chunk
     ) -> asyncio.Task:
         self._mic_stream = sd.InputStream(

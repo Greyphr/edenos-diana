@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 
 import numpy as np
@@ -26,17 +25,9 @@ def chunk_rms(chunk: bytes) -> float:
 async def run():
     config = load_voice_config()
 
-    picovoice_key = os.getenv("PICOVOICE_ACCESS_KEY")
-    if not picovoice_key:
-        raise RuntimeError(
-            "PICOVOICE_ACCESS_KEY not set. Copy .env.example to .env and fill it in."
-        )
-
     provider = get_voice_provider(config)
     audio = AudioIO()
-    wake_detector = WakeWordDetector(
-        access_key=picovoice_key, model_path=os.getenv("WAKE_WORD_MODEL_PATH")
-    )
+    wake_detector = WakeWordDetector()
     mic_task = None
     speaker_task = None
     state_task = None
