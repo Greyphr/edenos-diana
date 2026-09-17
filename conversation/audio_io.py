@@ -7,14 +7,24 @@ SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
+CHIME_FREQUENCY_HZ = 880
+CHIME_DURATION_SECONDS = 0.2
+CHIME_AMPLITUDE = 0.3
+
 
 class AudioIO:
     def __init__(self):
         self._mic_stream: sd.InputStream | None = None
         self._speaker_stream: sd.OutputStream | None = None
         self._playback_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._engaged = False
 
-    async def start_mic(self, on_chunk) -> asyncio.Task:
+    def set_engaged(self, engaged: bool):
+        self._engaged = engaged
+
+    def start_mic(
+        self, wake_detector, on_wake, on_forward_chunk
+    ) -> asyncio.Task:
         self._mic_stream = sd.InputStream(
             samplerate=SEND_SAMPLE_RATE,
             channels=1,
@@ -28,7 +38,13 @@ class AudioIO:
                 data, overflowed = await asyncio.to_thread(
                     self._mic_stream.read, CHUNK_SIZE
                 )
-                await on_chunk(data.tobytes())
+                chunk = data.tobytes()
+
+                if wake_detector.process(chunk):
+                    on_wake()
+
+                if self._engaged:
+                    await on_forward_chunk(chunk)
 
         return asyncio.create_task(_capture_loop())
 
@@ -57,6 +73,17 @@ class AudioIO:
                 self._playback_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    def play_chime(self):
+        self.clear_queue()
+        n = int(RECEIVE_SAMPLE_RATE * CHIME_DURATION_SECONDS)
+        t = np.arange(n) / RECEIVE_SAMPLE_RATE
+        tone = (
+            CHIME_AMPLITUDE
+            * np.sin(2 * np.pi * CHIME_FREQUENCY_HZ * t)
+            * np.iinfo(np.int16).max
+        ).astype(np.int16)
+        self._playback_queue.put_nowait(tone.tobytes())
 
     def close(self):
         if self._mic_stream:

@@ -1,23 +1,24 @@
 # Model: gemini-3.1-flash-live-preview
 # (current low-latency Live/native-audio model as of Sept 2026, per Google docs)
 import asyncio
+import os
 from collections.abc import Callable
 
 from google import genai
 from google.genai import types
 
+from conversation.voice_provider import VoiceProvider
 
 MODEL = "gemini-3.1-flash-live-preview"
 
-SYSTEM_INSTRUCTION = (
-    "You are Eden, Christopher's personal AI assistant. "
-    "You are conversational and concise. "
-    "Respond naturally and keep replies brief unless asked for detail."
-)
 
-
-class RealtimeSession:
-    def __init__(self, api_key: str):
+class GeminiLiveProvider(VoiceProvider):
+    def __init__(self):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY not set. Copy .env.example to .env and fill it in."
+            )
         self._client = genai.Client(
             api_key=api_key, http_options={"api_version": "v1alpha"}
         )
@@ -27,20 +28,20 @@ class RealtimeSession:
         self._interrupted_callback: Callable[[], None] | None = None
         self._receive_task: asyncio.Task | None = None
 
-    async def connect(
-        self,
-        on_audio: Callable[[bytes], None],
-        on_interrupted: Callable[[], None] | None = None,
-    ):
-        self._audio_callback = on_audio
-        self._interrupted_callback = on_interrupted
+    async def start_session(self, system_instruction: str, voice_config: dict) -> None:
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=system_instruction,
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=voice_config["voice_name"]
+                    )
+                ),
+                language_code=voice_config["language_code"],
+            ),
         )
-        self._session_ctx = self._client.aio.live.connect(
-            model=MODEL, config=config
-        )
+        self._session_ctx = self._client.aio.live.connect(model=MODEL, config=config)
         self._session = await self._session_ctx.__aenter__()
         self._receive_task = asyncio.create_task(self._receive_loop())
 
@@ -72,7 +73,7 @@ class RealtimeSession:
         except Exception as e:
             print(f"Realtime session error: {e}")
 
-    async def send_audio(self, chunk: bytes):
+    async def send_audio(self, chunk: bytes) -> None:
         if self._session is None:
             return
         await self._session.send_realtime_input(
@@ -82,7 +83,13 @@ class RealtimeSession:
             )
         )
 
-    async def close(self):
+    def on_audio_response(self, callback: Callable[[bytes], None]) -> None:
+        self._audio_callback = callback
+
+    def on_interrupted(self, callback: Callable[[], None]) -> None:
+        self._interrupted_callback = callback
+
+    async def stop_session(self) -> None:
         if self._receive_task:
             self._receive_task.cancel()
             try:

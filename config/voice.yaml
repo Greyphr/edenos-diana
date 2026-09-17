@@ -1,0 +1,11 @@
+provider: gemini_live
+voice_name: Sulafat
+language_code: en-US
+personality:
+  accent: neutral
+  style: calm
+  tone: warm
+  pacing: moderate
+  expressiveness: natural
+  humor: dry
+  formality: casual
