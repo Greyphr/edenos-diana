@@ -26,7 +26,9 @@ async def run():
         def on_model_audio(data: bytes):
             audio.enqueue_audio(data)
 
-        await session.connect(on_audio=on_model_audio)
+        await session.connect(
+            on_audio=on_model_audio, on_interrupted=audio.clear_queue
+        )
         mic_task = await audio.start_mic(on_mic_chunk)
         speaker_task = await audio.start_speaker()
 

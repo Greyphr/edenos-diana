@@ -1,5 +1,6 @@
 import asyncio
 import sounddevice as sd
+import numpy as np
 
 
 SEND_SAMPLE_RATE = 16000
@@ -24,7 +25,7 @@ class AudioIO:
 
         async def _capture_loop():
             while True:
-                data = await asyncio.to_thread(
+                data, overflowed = await asyncio.to_thread(
                     self._mic_stream.read, CHUNK_SIZE
                 )
                 await on_chunk(data.tobytes())
@@ -42,12 +43,20 @@ class AudioIO:
         async def _playback_loop():
             while True:
                 chunk = await self._playback_queue.get()
-                await asyncio.to_thread(self._speaker_stream.write, chunk)
+                samples = np.frombuffer(chunk, dtype=np.int16)
+                await asyncio.to_thread(self._speaker_stream.write, samples)
 
         return asyncio.create_task(_playback_loop())
 
     def enqueue_audio(self, data: bytes):
         self._playback_queue.put_nowait(data)
+
+    def clear_queue(self):
+        while not self._playback_queue.empty():
+            try:
+                self._playback_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     def close(self):
         if self._mic_stream:

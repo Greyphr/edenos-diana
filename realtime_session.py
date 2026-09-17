@@ -24,10 +24,16 @@ class RealtimeSession:
         self._session = None
         self._session_ctx = None
         self._audio_callback: Callable[[bytes], None] | None = None
+        self._interrupted_callback: Callable[[], None] | None = None
         self._receive_task: asyncio.Task | None = None
 
-    async def connect(self, on_audio: Callable[[bytes], None]):
+    async def connect(
+        self,
+        on_audio: Callable[[bytes], None],
+        on_interrupted: Callable[[], None] | None = None,
+    ):
         self._audio_callback = on_audio
+        self._interrupted_callback = on_interrupted
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=SYSTEM_INSTRUCTION,
@@ -42,6 +48,14 @@ class RealtimeSession:
         try:
             while True:
                 async for response in self._session.receive():
+                    if (
+                        response.server_content
+                        and response.server_content.interrupted
+                    ):
+                        if self._interrupted_callback:
+                            self._interrupted_callback()
+                        continue
+
                     if (
                         response.server_content
                         and response.server_content.model_turn
