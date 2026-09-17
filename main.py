@@ -9,6 +9,7 @@ from conversation.audio_io import AudioIO
 from conversation.voice_config import build_system_instruction, load_voice_config
 from conversation.voice_provider import get_voice_provider
 from conversation.wake_word import WakeWordDetector
+from identity.recognition import SpeakerRecognizer
 
 IDLE_TIMEOUT_SECONDS = 8.0
 SPEECH_RMS_THRESHOLD = 400
@@ -28,6 +29,7 @@ async def run():
     provider = get_voice_provider(config)
     audio = AudioIO()
     wake_detector = WakeWordDetector()
+    recognizer = SpeakerRecognizer()
     mic_task = None
     speaker_task = None
     state_task = None
@@ -47,7 +49,16 @@ async def run():
         async def on_forward_chunk(chunk: bytes):
             if chunk_rms(chunk) >= SPEECH_RMS_THRESHOLD:
                 mark_activity()
+            recognizer.feed(chunk)
             await provider.send_audio(chunk)
+
+        def print_recognition(name, confidence, recognized):
+            if recognized:
+                print(f"Recognized: {name} ({confidence:.2f})")
+            else:
+                print(f"Unrecognized speaker ({confidence:.2f})")
+
+        recognizer.on_result(print_recognition)
 
         def on_wake():
             if state["value"] == STATE_IDLE:
