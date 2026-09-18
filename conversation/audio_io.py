@@ -1,6 +1,10 @@
 import asyncio
+import logging
+
 import sounddevice as sd
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 SEND_SAMPLE_RATE = 16000
@@ -35,9 +39,20 @@ class AudioIO:
 
         async def _capture_loop():
             while True:
-                data, overflowed = await asyncio.to_thread(
-                    self._mic_stream.read, CHUNK_SIZE
-                )
+                try:
+                    data, overflowed = await asyncio.to_thread(
+                        self._mic_stream.read, CHUNK_SIZE
+                    )
+                except sd.PortAudioError as e:
+                    # Audio-device-level failure (device unplugged/disabled).
+                    # Do NOT re-enumerate or recover in-process: let the error
+                    # crash the process so daemon.py's outer restart handles it.
+                    logger.error(
+                        "Microphone capture failed (%s). Exiting so the daemon "
+                        "can restart Eden.",
+                        e,
+                    )
+                    raise
                 chunk = data.tobytes()
 
                 if wake_detector.process(chunk):
@@ -60,7 +75,17 @@ class AudioIO:
             while True:
                 chunk = await self._playback_queue.get()
                 samples = np.frombuffer(chunk, dtype=np.int16)
-                await asyncio.to_thread(self._speaker_stream.write, samples)
+                try:
+                    await asyncio.to_thread(self._speaker_stream.write, samples)
+                except sd.PortAudioError as e:
+                    # Same policy as the capture loop: no in-process recovery,
+                    # let it crash so the daemon restarts everything.
+                    logger.error(
+                        "Speaker playback failed (%s). Exiting so the daemon "
+                        "can restart Eden.",
+                        e,
+                    )
+                    raise
 
         return asyncio.create_task(_playback_loop())
 

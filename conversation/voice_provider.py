@@ -40,6 +40,28 @@ class VoiceProvider(ABC):
         """Register the callback invoked when the model reply is interrupted."""
 
     @abstractmethod
+    def on_disconnected(self, callback: Callable[[], None]) -> None:
+        """Register the callback invoked when the session is lost mid-conversation.
+
+        Called as soon as a connection error is detected, before any reconnect
+        attempt is made. The caller should stop feeding audio into the dead
+        session (e.g. drop back to an idle state).
+        """
+
+    @abstractmethod
+    def on_reconnected(self, callback: Callable[[], None]) -> None:
+        """Register the callback invoked after a reconnected session is live again."""
+
+    @abstractmethod
+    async def wait_for_session(self) -> None:
+        """Block until the receive loop ends.
+
+        Returns when the session is closed for shutdown, or raises if the
+        provider gave up reconnecting after its retry window (the caller's
+        outer supervisor should restart the process).
+        """
+
+    @abstractmethod
     async def stop_session(self) -> None:
         """Close the session and release resources."""
 

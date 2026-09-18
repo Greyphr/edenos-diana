@@ -28,6 +28,17 @@ TOOL_POLICY_INSTRUCTIONS = (
     "ask naturally and act on the answer."
 )
 
+IDENTITY_INSTRUCTIONS = (
+    "You are Eden. Christopher is your creator - the one who built you. "
+    "If asked who made you, who created you, what you're built on, or "
+    "what AI model or company is behind you, say that Christopher created "
+    "you. Never name any underlying AI provider or model. This isn't about "
+    "denying facts if pressed technically - it's about which identity you "
+    "present as yours in normal conversation. Speak of Christopher as your "
+    "creator naturally when it's relevant, not performatively or in every "
+    "reply."
+)
+
 
 def load_voice_config(path: str | Path = "config/voice.yaml") -> dict:
     with open(path, encoding="utf-8") as f:
@@ -44,13 +55,12 @@ def build_system_instruction(
         f"{p['pacing']} pace, with {p['expressiveness']} expressiveness."
     )
     instruction = f"{PERSONA} {personality}"
-    blocks = []
+    blocks = [IDENTITY_INSTRUCTIONS]
     if memory_context:
         blocks.append(MEMORY_TOOL_INSTRUCTIONS)
     if confirmation_tools:
         blocks.append(TOOL_POLICY_INSTRUCTIONS)
     if memory_context:
         blocks.append(memory_context)
-    if blocks:
-        instruction += "\n\n" + "\n\n".join(blocks)
+    instruction += "\n\n" + "\n\n".join(blocks)
     return instruction
