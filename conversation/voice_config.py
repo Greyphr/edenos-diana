@@ -14,11 +14,14 @@ def load_voice_config(path: str | Path = "config/voice.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def build_system_instruction(config: dict) -> str:
+def build_system_instruction(config: dict, memory_context: str = "") -> str:
     p = config["personality"]
     personality = (
         f"Speak with a {p['accent']} accent, in a {p['tone']}, {p['style']} "
         f"way, with {p['formality']} formality and {p['humor']} humor, at a "
         f"{p['pacing']} pace, with {p['expressiveness']} expressiveness."
     )
-    return f"{PERSONA} {personality}"
+    instruction = f"{PERSONA} {personality}"
+    if memory_context:
+        instruction += f"\n\n{memory_context}"
+    return instruction
