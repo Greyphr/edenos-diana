@@ -10,7 +10,9 @@ def role_for_actor(recognized: bool) -> str:
 
 
 def has_permission(role: str, risk_tier: RiskTier) -> bool:
-    """Role-based permission: owner may act at every tier; unknown only READ."""
+    """Role-based permission: owner may act at every tier; unknown may only
+    use READ. That includes explicitly NOT TRIVIAL: TRIVIAL runs with no
+    confirmation step, so it must stay owner-gated like WRITE/SENSITIVE."""
     if role == ROLE_OWNER:
         return True
     if role == ROLE_UNKNOWN:

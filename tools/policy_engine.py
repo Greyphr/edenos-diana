@@ -59,7 +59,11 @@ class PolicyEngine:
                 )
                 return {"error": "not permitted"}
 
-            if spec.risk_tier == RiskTier.READ:
+            if spec.risk_tier in (RiskTier.READ, RiskTier.TRIVIAL):
+                # Both tiers run the handler directly — no confirmation
+                # pending state. The permission check above still gates them:
+                # unknown is denied for TRIVIAL (owner-only, confirmation-free),
+                # as well as WRITE/SENSITIVE.
                 return await spec.handler(**args)
 
             return self._store_pending(spec, args)
@@ -108,6 +112,18 @@ class PolicyEngine:
                 "Pending action %r expired without confirmation", pending["tool_name"]
             )
             return {"status": "cancelled"}
+
+        # Re-check the actor's permission now, not just when the action was
+        # first proposed: the person confirming must still be authorized.
+        # Someone who merely overheard the phrase shouldn't complete it.
+        role = role_for_actor(self._get_recognized())
+        if not has_permission(role, pending["risk_tier"]):
+            self._pending = None
+            logger.info(
+                "Pending action %r denied for role %r (tier=%s) at confirmation",
+                pending["tool_name"], role, pending["risk_tier"].value,
+            )
+            return {"error": "not permitted"}
 
         if pending["risk_tier"] == RiskTier.SENSITIVE:
             affirmed = pending["required_confirmation"].lower() in response_text

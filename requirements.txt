@@ -7,3 +7,7 @@ onnxruntime>=1.17.0
 # resemblyzer pulls in torch — a much larger install than anything else here
 resemblyzer>=0.1.4
 PyYAML>=6.0
+# tools/vault.py: Fernet symmetric encryption for dynamic secrets (Spotify refresh token, etc.)
+cryptography>=42.0.0
+# integrations/spotify/client.py: async Web API client
+httpx>=0.27.0

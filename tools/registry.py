@@ -3,6 +3,7 @@ from enum import Enum
 
 class RiskTier(Enum):
     READ = "read"
+    TRIVIAL = "trivial"
     WRITE = "write"
     SENSITIVE = "sensitive"
 
