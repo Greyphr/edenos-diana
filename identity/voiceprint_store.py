@@ -69,6 +69,27 @@ class VoiceprintStore:
     def list_profiles(self) -> list[str]:
         return [p.get("name", "") for p in self.load_all()]
 
+    def archive_profile(self, name: str) -> str | None:
+        """Move a profile aside with a timestamp suffix instead of deleting it.
+
+        Archived files live under ``identity/voiceprints/archived/`` so the
+        active scan (``os.listdir`` of the root, ``.json`` only) never
+        re-reads them as live profiles.
+        """
+        path = os.path.join(self.profiles_dir, f"{name}.json")
+        if not os.path.isfile(path):
+            return None
+        archive_dir = os.path.join(self.profiles_dir, "archived")
+        os.makedirs(archive_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        dest = os.path.join(archive_dir, f"{name}.{ts}.json")
+        n = 1
+        while os.path.exists(dest):
+            dest = os.path.join(archive_dir, f"{name}.{ts}-{n}.json")
+            n += 1
+        os.replace(path, dest)
+        return dest
+
     @staticmethod
     def average_embeddings(embeddings: list[np.ndarray]) -> np.ndarray:
         """Mean of many embeddings, normalized to unit length for scoring."""

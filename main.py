@@ -17,6 +17,9 @@ from memory.tools import (
     REMEMBER_DECLARATION,
     make_memory_handlers,
 )
+from tools.policy_engine import PolicyEngine
+from tools.reenroll_voice import make_reenroll_voice_spec
+from tools.registry import ToolRegistry
 
 IDLE_TIMEOUT_SECONDS = 8.0
 SPEECH_RMS_THRESHOLD = 400
@@ -47,6 +50,30 @@ async def run():
     for name, handler in memory_handlers.items():
         provider.register_tool(name, handler)
 
+    # Recognition state driving the policy engine: a rolling window of the
+    # last few results within the current engaged session. The actor counts
+    # as recognized if any recent result was a confident recognition, so one
+    # weak/short utterance doesn't flip the gate off. The window is cleared
+    # whenever the session goes back to idle so stale results don't linger.
+    RECOGNITION_WINDOW = 3
+    recognition_state = {"history": []}
+
+    def record_recognition(recognized: bool) -> None:
+        history = recognition_state["history"]
+        history.append(bool(recognized))
+        if len(history) > RECOGNITION_WINDOW:
+            del history[:-RECOGNITION_WINDOW]
+
+    def get_recognized() -> bool:
+        return any(recognition_state["history"])
+
+    tool_registry = ToolRegistry()
+    tool_registry.register(make_reenroll_voice_spec())
+    policy = PolicyEngine(tool_registry, get_recognized)
+    for spec in tool_registry.all_specs():
+        provider.register_tool(spec.name, policy.wrap_handler(spec))
+    provider.register_tool("confirm_action", policy.confirm_action)
+
     mic_task = None
     speaker_task = None
     state_task = None
@@ -70,6 +97,7 @@ async def run():
             await provider.send_audio(chunk)
 
         def print_recognition(name, confidence, recognized, duration_s):
+            record_recognition(recognized)
             dur = f", {duration_s:.1f}s" if duration_s is not None else ""
             if recognized:
                 print(f"Recognized: {name} ({confidence:.2f}{dur})")
@@ -98,6 +126,7 @@ async def run():
                     if time.monotonic() - last_activity[0] > IDLE_TIMEOUT_SECONDS:
                         audio.set_engaged(False)
                         state["value"] = STATE_IDLE
+                        recognition_state["history"] = []
                         print(
                             f"No speech or response for {IDLE_TIMEOUT_SECONDS}s "
                             "- going quiet..."
@@ -106,9 +135,13 @@ async def run():
         provider.on_audio_response(on_model_audio)
         provider.on_interrupted(audio.clear_queue)
         await provider.start_session(
-            build_system_instruction(config, memory_context),
+            build_system_instruction(config, memory_context, confirmation_tools=True),
             config,
-            tool_declarations=[REMEMBER_DECLARATION, RECALL_DECLARATION],
+            tool_declarations=[
+                REMEMBER_DECLARATION,
+                RECALL_DECLARATION,
+                *policy.declarations(),
+            ],
         )
         mic_task = await audio.start_mic(wake_detector, on_wake, on_forward_chunk)
         speaker_task = await audio.start_speaker()
