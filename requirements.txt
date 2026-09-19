@@ -1,3 +1,8 @@
+# requirements.txt states intent: minimum versions known to work.
+# requirements-lock.txt pins the exact versions actually installed and
+# tested (generated with `pip freeze > requirements-lock.txt` under the
+# project venv). Use the lock file for reproducible installs; bump the
+# minimums here deliberately when a new version is required.
 google-genai>=1.0.0
 sounddevice>=0.4.0
 python-dotenv>=1.0.0
