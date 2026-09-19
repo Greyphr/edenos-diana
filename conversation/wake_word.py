@@ -45,7 +45,10 @@ class WakeWordDetector:
             frame = np.frombuffer(self._buffer[: self._frame_bytes], dtype=np.int16)
             del self._buffer[: self._frame_bytes]
             scores = self._model.predict(frame)
-            if any(
+            # predict() returns the per-model score dict (timing=False, which
+            # this detector never enables). Guard the shape anyway so a future
+            # SDK change can't crash wake-word processing.
+            if isinstance(scores, dict) and any(
                 float(score) >= DETECTION_THRESHOLD for score in scores.values()
             ):
                 detected = True

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 
 import numpy as np
 
@@ -50,7 +51,7 @@ class UtteranceVAD:
         self.min_utterance_ms = min_utterance_ms
         self.hangover_ms = hangover_ms
         self.max_utterance_ms = max_utterance_ms
-        self.on_utterance = None
+        self.on_utterance: Callable[[bytes], None] | None = None
         self._floor: float | None = None
         self.reset()
 

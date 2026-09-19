@@ -29,19 +29,20 @@ class AudioIO:
     async def start_mic(
         self, wake_detector, on_wake, on_forward_chunk
     ) -> asyncio.Task:
-        self._mic_stream = sd.InputStream(
+        mic_stream = sd.InputStream(
             samplerate=SEND_SAMPLE_RATE,
             channels=1,
             dtype="int16",
             blocksize=CHUNK_SIZE,
         )
-        self._mic_stream.start()
+        mic_stream.start()
+        self._mic_stream = mic_stream
 
         async def _capture_loop():
             while True:
                 try:
                     data, overflowed = await asyncio.to_thread(
-                        self._mic_stream.read, CHUNK_SIZE
+                        mic_stream.read, CHUNK_SIZE
                     )
                 except sd.PortAudioError as e:
                     # Audio-device-level failure (device unplugged/disabled).
@@ -64,19 +65,20 @@ class AudioIO:
         return asyncio.create_task(_capture_loop())
 
     async def start_speaker(self) -> asyncio.Task:
-        self._speaker_stream = sd.OutputStream(
+        speaker_stream = sd.OutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=1,
             dtype="int16",
         )
-        self._speaker_stream.start()
+        speaker_stream.start()
+        self._speaker_stream = speaker_stream
 
         async def _playback_loop():
             while True:
                 chunk = await self._playback_queue.get()
                 samples = np.frombuffer(chunk, dtype=np.int16)
                 try:
-                    await asyncio.to_thread(self._speaker_stream.write, samples)
+                    await asyncio.to_thread(speaker_stream.write, samples)
                 except sd.PortAudioError as e:
                     # Same policy as the capture loop: no in-process recovery,
                     # let it crash so the daemon restarts everything.
