@@ -13,10 +13,12 @@ Two playback paths:
   a successful local launch has just created one, so those tools rely on it.
 """
 
+import asyncio
 import logging
 import os
 import platform
 import re
+import shutil
 import subprocess
 import time
 
@@ -30,6 +32,10 @@ TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE = "https://api.spotify.com"
 VAULT_KEY_NAME = "spotify_refresh_token"
 EXPIRY_SLACK_SECONDS = 30  # refresh slightly before the token actually dies
+# 429 rate-limit sleep: honor Retry-After, but cap it so a misbehaving header
+# can't stall the conversation for minutes.
+RETRY_AFTER_CAP_SECONDS = 10.0
+RETRY_AFTER_DEFAULT_SECONDS = 1.0
 
 _TRACK_LINK_RE = re.compile(r"https?://open\.spotify\.com/track/([A-Za-z0-9]+)")
 
@@ -85,6 +91,7 @@ class SpotifyClient:
             )
         self._access_token: str | None = None
         self._access_expires_at: float = 0.0
+        self._refresh_lock = asyncio.Lock()
         self._refresh_client = httpx.AsyncClient(timeout=30, transport=transport)
         self._client = httpx.AsyncClient(
             base_url=API_BASE,
@@ -96,29 +103,60 @@ class SpotifyClient:
         await self._client.aclose()
         await self._refresh_client.aclose()
 
-    async def _refresh_access_token(self) -> None:
-        form = {
-            "grant_type": "refresh_token",
-            "refresh_token": self._refresh_token,
-            "client_id": os.getenv("SPOTIFY_CLIENT_ID"),
-            "client_secret": os.getenv("SPOTIFY_CLIENT_SECRET"),
-        }
-        response = await self._refresh_client.post(TOKEN_URL, data=form)
-        response.raise_for_status()
-        data = response.json()
-        self._access_token = data["access_token"]
-        self._access_expires_at = (
-            time.time() + int(data.get("expires_in", 3600)) - EXPIRY_SLACK_SECONDS
-        )
-        rotated = data.get("refresh_token")
-        if rotated and rotated != self._refresh_token:
-            logger.info("Spotify rotated the refresh token; updating the vault")
-            self._refresh_token = rotated
-            self._vault.set(VAULT_KEY_NAME, rotated)
+    async def _refresh_access_token(self, *, force: bool = False) -> None:
+        async with self._refresh_lock:
+            # Serialize refreshes: concurrent callers that all saw a stale
+            # token wait on the lock, then re-check and skip when a peer
+            # already refreshed. `force` bypasses the re-check so a 401
+            # always round-trips to the token endpoint even if the cached
+            # expiry still looks valid.
+            if (
+                not force
+                and self._access_token is not None
+                and time.time() < self._access_expires_at
+            ):
+                return
+            form = {
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": os.getenv("SPOTIFY_CLIENT_ID"),
+                "client_secret": os.getenv("SPOTIFY_CLIENT_SECRET"),
+            }
+            response = await self._refresh_client.post(TOKEN_URL, data=form)
+            response.raise_for_status()
+            data = response.json()
+            self._access_token = data["access_token"]
+            self._access_expires_at = (
+                time.time() + int(data.get("expires_in", 3600)) - EXPIRY_SLACK_SECONDS
+            )
+            rotated = data.get("refresh_token")
+            if rotated and rotated != self._refresh_token:
+                logger.info("Spotify rotated the refresh token; updating the vault")
+                self._refresh_token = rotated
+                self._vault.set(VAULT_KEY_NAME, rotated)
 
     async def _ensure_access_token(self) -> None:
         if self._access_token is None or time.time() >= self._access_expires_at:
             await self._refresh_access_token()
+
+    def _retry_after_seconds(self, response: httpx.Response) -> float:
+        """Delay to honor a 429 Retry-After, bounded so a hostile header
+        can't stall the conversation for minutes."""
+        raw = response.headers.get("Retry-After")
+        if not raw:
+            return RETRY_AFTER_DEFAULT_SECONDS
+        try:
+            seconds = float(raw)
+        except ValueError:
+            logger.warning(
+                "Unparseable Retry-After %r; defaulting to %.0fs",
+                raw,
+                RETRY_AFTER_DEFAULT_SECONDS,
+            )
+            return RETRY_AFTER_DEFAULT_SECONDS
+        if seconds < 0:
+            seconds = 0.0
+        return min(seconds, RETRY_AFTER_CAP_SECONDS)
 
     async def _request(
         self,
@@ -133,9 +171,17 @@ class SpotifyClient:
         response = await self._client.request(
             method, path, params=params, json=json_body, headers=headers
         )
+        if response.status_code == 429:
+            # Rate-limited: honor Retry-After (bounded) and retry once.
+            delay = self._retry_after_seconds(response)
+            logger.warning("Spotify API rate-limited (429); retrying in %.1fs", delay)
+            await asyncio.sleep(delay)
+            response = await self._client.request(
+                method, path, params=params, json=json_body, headers=headers
+            )
         if response.status_code == 401:
             logger.info("Spotify API returned 401; refreshing access token and retrying")
-            await self._refresh_access_token()
+            await self._refresh_access_token(force=True)
             headers = {"Authorization": f"Bearer {self._access_token}"}
             response = await self._client.request(
                 method, path, params=params, json=json_body, headers=headers
@@ -209,6 +255,11 @@ class SpotifyClient:
             raise SpotifyError(
                 f"No local protocol opener for platform {system!r} - "
                 "can't launch a track outside the Web API path."
+            )
+        if shutil.which(opener) is None:
+            raise SpotifyError(
+                f"Could not open Spotify locally: {opener!r} is not installed "
+                "on this system."
             )
         try:
             subprocess.Popen(
