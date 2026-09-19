@@ -10,7 +10,11 @@ from conversation.audio_io import AudioIO
 from conversation.voice_config import build_system_instruction, load_voice_config
 from conversation.voice_provider import get_voice_provider
 from conversation.wake_word import WakeWordDetector
-from identity.recognition import CONFIDENCE_RECOGNIZED, SpeakerRecognizer
+from identity.recognition import (
+    CONFIDENCE_RECOGNIZED,
+    CONFIDENCE_UNCERTAIN,
+    SpeakerRecognizer,
+)
 from identity.voiceprint_store import VoiceprintStore
 from integrations.spotify.client import SpotifyClient
 from integrations.spotify.tools import make_spotify_specs
@@ -24,7 +28,9 @@ IDLE_TIMEOUT_SECONDS = 8.0
 # How long a single strong recognition keeps the actor treated as the owner.
 # Short, weak utterances don't each get scored as a fresh recognition; this
 # window spans the gap between them within one continuous engaged session.
-# Never carried across idle transitions (cleared in go_idle/reset).
+# A confident non-match (confidence < CONFIDENCE_UNCERTAIN) cuts through it
+# immediately. Never carried across idle transitions (cleared in
+# go_idle/reset).
 RECOGNITION_TRUST_WINDOW_SECONDS = 25
 # Confirmation-grade freshness, deliberately stricter: approving a pending
 # WRITE/SENSITIVE action requires a recognition within the last few seconds,
@@ -42,22 +48,31 @@ class RecognitionTrust:
     CONFIDENCE_RECOGNIZED) within the current engaged session.
 
     A strong hit keeps treating the actor as the owner for
-    ``window_seconds`` regardless of how many weak/short results follow it,
-    and ``reset()`` (called on the way back to idle) guarantees trust never
-    carries across sessions.
+    ``window_seconds`` regardless of uncertain results that follow it. A
+    confident non-match (confidence < CONFIDENCE_UNCERTAIN) invalidates
+    trust immediately, and the ambiguous 0.70-0.79 band in between is where
+    short/weak-but-plausibly-owner utterances land - the window exists to
+    tolerate exactly those, so they change nothing. ``reset()`` (called on
+    the way back to idle) guarantees trust never carries across sessions.
     """
 
     def __init__(
         self, window_seconds: float = RECOGNITION_TRUST_WINDOW_SECONDS
     ) -> None:
         self.window_seconds = window_seconds
-        # Timestamp of the last strong recognition, or None before any.
+        # Timestamp of the last strong recognition, or None before any or
+        # after a confident non-match.
         self.last_strong_at: float | None = None
 
     def record(self, recognized: bool, confidence: float) -> None:
-        # Only a genuinely confident result renews trust, not every result.
         if recognized and confidence >= CONFIDENCE_RECOGNIZED:
+            # Genuinely confident hit: renew the trust window.
             self.last_strong_at = time.time()
+        elif confidence < CONFIDENCE_UNCERTAIN:
+            # Confident non-match: someone who clearly isn't the owner just
+            # spoke, so invalidate trust immediately regardless of how
+            # recent the last strong hit was.
+            self.last_strong_at = None
 
     def is_recognized(self) -> bool:
         return self._within(self.window_seconds)
@@ -100,9 +115,11 @@ async def run():
     # Recognition state driving the policy engine. The actor stays treated
     # as the owner for RECOGNITION_TRUST_WINDOW_SECONDS after the last
     # strong recognition (confidence >= CONFIDENCE_RECOGNIZED), so several
-    # short, weak utterances in a row don't each flip the gate — a time-based
-    # trust window, not a count-based rolling window. Cleared on the way back
-    # to STATE_IDLE so trust never carries across sessions.
+    # short, weak (uncertain-band, 0.70-0.79) utterances in a row don't each
+    # flip the gate - a time-based trust window, not a count-based rolling
+    # window. A confident non-match (confidence < CONFIDENCE_UNCERTAIN)
+    # invalidates it immediately. Cleared on the way back to STATE_IDLE so
+    # trust never carries across sessions.
     recognition_state = RecognitionTrust()
 
     def record_recognition(recognized: bool, confidence: float) -> None:
@@ -172,6 +189,11 @@ async def run():
             # Drop any half-finished utterance so its buffer can't be stitched
             # onto the first audio of the next engaged session.
             recognizer.reset()
+            # An unconfirmed proposal (e.g. a WRITE/SENSITIVE action the owner
+            # never got to confirm) must not outlive the session: otherwise it
+            # would reject the next session's identical request as "already
+            # pending" before it's even presented for confirmation.
+            policy.clear_pending()
             print(reason)
 
         def on_model_audio(data: bytes):

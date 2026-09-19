@@ -16,7 +16,7 @@ _AFFIRMATIVES = frozenset({"yes", "yeah", "confirm", "do it", "go ahead"})
 # full JSON Schema validator - just enough to catch a model that omits a
 # required argument or passes a plainly wrong kind of value, so those mistakes
 # fail loudly instead of surfacing deep inside a handler.
-_BASIC_TYPE_CHECKS = {
+_BASIC_TYPE_CHECKS: dict[str, Callable[[object], bool]] = {
     "string": lambda value: isinstance(value, str),
     "boolean": lambda value: isinstance(value, bool),
     "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
@@ -38,8 +38,13 @@ def _check_args(spec: ToolSpec, args: dict) -> None:
                 f"Tool {spec.name!r} is missing required argument {key!r}"
             )
     for key, value in args.items():
-        declared_type = (properties.get(key) or {}).get("type")
-        check = _BASIC_TYPE_CHECKS.get(declared_type)
+        type_info = properties.get(key) or {}
+        declared_type = type_info.get("type")
+        check = (
+            _BASIC_TYPE_CHECKS.get(declared_type)
+            if isinstance(declared_type, str)
+            else None
+        )
         if check is not None and not check(value):
             raise ValueError(
                 f"Tool {spec.name!r} argument {key!r} must be a "
@@ -169,6 +174,21 @@ class PolicyEngine:
             "status": "confirmation_required",
             "ask": "Ask the owner to confirm before doing this.",
         }
+
+    def clear_pending(self) -> None:
+        """Drop any action still waiting for confirmation.
+
+        Called on the way back to idle, so an unconfirmed proposal can't
+        outlive its session and reject the next session's identical request
+        as "already pending". Logs only when something was actually cleared,
+        keeping the common already-empty case quiet.
+        """
+        if self._pending is not None:
+            logger.info(
+                "Cleared pending action %r (idle timeout fired before confirmation)",
+                self._pending["tool_name"],
+            )
+            self._pending = None
 
     async def confirm_action(self, response: str = "", **extra) -> dict:
         response_text = (response or "").strip().lower()

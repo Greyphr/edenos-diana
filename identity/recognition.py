@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Cosine-similarity thresholds against the enrolled profile.
 CONFIDENCE_RECOGNIZED = 0.80  # >= this: recognized
-CONFIDENCE_UNCERTAIN = 0.70   # 0.70-0.89: uncertain, reported as not recognized
+CONFIDENCE_UNCERTAIN = 0.70   # 0.70-0.79: uncertain band - neither a
+                              # confident match nor a confident non-match
 # Utterances shorter than this rarely produce a reliable embedding, so they
 # are skipped rather than scored and reported as low-confidence.
 SCORING_MIN_MS = 1000
