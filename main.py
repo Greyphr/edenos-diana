@@ -15,11 +15,7 @@ from identity.voiceprint_store import VoiceprintStore
 from integrations.spotify.client import SpotifyClient
 from integrations.spotify.tools import make_spotify_specs
 from memory.context import build_context_summary
-from memory.tools import (
-    RECALL_DECLARATION,
-    REMEMBER_DECLARATION,
-    make_memory_handlers,
-)
+from memory.tools import make_memory_handlers
 from tools.policy_engine import PolicyEngine
 from tools.reenroll_voice import make_reenroll_voice_spec
 from tools.registry import ToolRegistry
@@ -30,6 +26,10 @@ IDLE_TIMEOUT_SECONDS = 8.0
 # window spans the gap between them within one continuous engaged session.
 # Never carried across idle transitions (cleared in go_idle/reset).
 RECOGNITION_TRUST_WINDOW_SECONDS = 25
+# Confirmation-grade freshness, deliberately stricter: approving a pending
+# WRITE/SENSITIVE action requires a recognition within the last few seconds,
+# not just stale trust from earlier in the session.
+CONFIRMATION_TRUST_WINDOW_SECONDS = 5
 SPEECH_RMS_THRESHOLD = 400
 
 STATE_IDLE = "idle"
@@ -60,9 +60,19 @@ class RecognitionTrust:
             self.last_strong_at = time.time()
 
     def is_recognized(self) -> bool:
+        return self._within(self.window_seconds)
+
+    def is_freshly_recognized(self, window_seconds: float) -> bool:
+        """Confirmation-grade freshness. Same single timestamp as
+        :meth:`is_recognized`, but a much shorter window — meant to gate
+        confirm_action, which should require evidence from right now, not
+        stale trust earned earlier in the session."""
+        return self._within(window_seconds)
+
+    def _within(self, window_seconds: float) -> bool:
         if self.last_strong_at is None:
             return False
-        return (time.time() - self.last_strong_at) <= self.window_seconds
+        return (time.time() - self.last_strong_at) <= window_seconds
 
     def reset(self) -> None:
         self.last_strong_at = None
@@ -86,9 +96,6 @@ async def run():
     profiles = VoiceprintStore().list_profiles()
     owner_name = profiles[0] if len(profiles) == 1 else "christopher"
     memory_context = build_context_summary(owner_name)
-    memory_handlers = make_memory_handlers(owner_name)
-    for name, handler in memory_handlers.items():
-        provider.register_tool(name, handler)
 
     # Recognition state driving the policy engine. The actor stays treated
     # as the owner for RECOGNITION_TRUST_WINDOW_SECONDS after the last
@@ -104,8 +111,19 @@ async def run():
     def get_recognized() -> bool:
         return recognition_state.is_recognized()
 
+    # Confirmation needs fresher evidence than ordinary tool gating: a
+    # recognition within the (much shorter) confirmation window.
+    def get_freshly_recognized() -> bool:
+        return recognition_state.is_freshly_recognized(CONFIRMATION_TRUST_WINDOW_SECONDS)
+
     tool_registry = ToolRegistry()
     tool_registry.register(make_reenroll_voice_spec())
+
+    # Memory tools go through the exact same registry + PolicyEngine as
+    # everything else: TRIVIAL tier, owner-only, confirmation-free (same
+    # reasoning as the Spotify playback tools).
+    for spec in make_memory_handlers(owner_name):
+        tool_registry.register(spec)
 
     # Spotify integration is optional at startup: without a stored refresh
     # token (or with VAULT_KEY/creds missing) we skip registering the tools
@@ -121,7 +139,15 @@ async def run():
         for spec in make_spotify_specs(spotify_client):
             tool_registry.register(spec)
 
-    policy = PolicyEngine(tool_registry, get_recognized)
+    policy = PolicyEngine(
+        tool_registry,
+        get_recognized,
+        get_freshly_recognized,
+        # Let the policy engine wait briefly for an in-flight recognition —
+        # otherwise the very first command of a session is judged before the
+        # utterance that carries it has been scored, and gets denied.
+        wait_for_pending=lambda: recognizer.wait_for_pending(timeout=1.5),
+    )
     for spec in tool_registry.all_specs():
         provider.register_tool(spec.name, policy.wrap_handler(spec))
     provider.register_tool("confirm_action", policy.confirm_action)
@@ -143,6 +169,9 @@ async def run():
             audio.set_engaged(False)
             state["value"] = STATE_IDLE
             recognition_state.reset()
+            # Drop any half-finished utterance so its buffer can't be stitched
+            # onto the first audio of the next engaged session.
+            recognizer.reset()
             print(reason)
 
         def on_model_audio(data: bytes):
@@ -174,8 +203,21 @@ async def run():
                 "Connection lost - going quiet; reconnecting in the background..."
             )
 
-        def on_reconnected():
-            print("Reconnected - say the wake word to continue.")
+        def on_reconnected(resumed: bool):
+            if resumed:
+                # Resumption carried the conversation over the ~10-minute
+                # connection cap (or a mid-session drop): stay/get back to
+                # engaged without the wake word. If a hard drop pushed us
+                # idle, wake the state machine; on a graceful GoAway reconnect
+                # we never left engaged, so just refresh the activity timer.
+                if state["value"] == STATE_IDLE:
+                    wake_event.set()
+                else:
+                    wake_event.clear()
+                    mark_activity()
+                print("Reconnected - conversation resumed.")
+            else:
+                print("Reconnected - say the wake word to continue.")
 
         async def state_machine():
             while True:
@@ -203,11 +245,7 @@ async def run():
         await provider.start_session(
             build_system_instruction(config, memory_context, confirmation_tools=True),
             config,
-            tool_declarations=[
-                REMEMBER_DECLARATION,
-                RECALL_DECLARATION,
-                *policy.declarations(),
-            ],
+            tool_declarations=list(policy.declarations()),
         )
         mic_task = await audio.start_mic(wake_detector, on_wake, on_forward_chunk)
         speaker_task = await audio.start_speaker()
@@ -240,6 +278,8 @@ async def run():
         await provider.stop_session()
         wake_detector.close()
         audio.close()
+        if spotify_client is not None:
+            await spotify_client.aclose()
 
 
 def main():
@@ -261,7 +301,11 @@ def main():
         print("\nStartup failed - resolve these critical issues and try again:")
         for name, passed, detail, severity in failed_critical:
             print(f"  - {name}: {detail}")
-        sys.exit(1)
+        # Exit 2 = configuration problem (as opposed to a runtime crash,
+        # which uses 1): daemon.py recognizes this code and refuses to
+        # restart, so a missing GEMINI_API_KEY stops letting the child
+        # respawn every 30 seconds forever.
+        sys.exit(2)
 
     warnings = [c for c in checks if not c[1]]
     if warnings:

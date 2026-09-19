@@ -6,9 +6,13 @@ restarts it on non-zero exits, with exponential backoff.
 - Non-zero exit -> restart after a backoff delay (2s, doubling to 30s cap);
   the backoff resets to 2s once the child has stayed up more than 60s.
 - Exit code 0 -> clean shutdown, no restart.
-- Ctrl+C on the daemon terminates the child and exits without restarting.
+- Exit code 2 (configuration problem, from main.py's failed critical
+  startup checks) -> no restart; print "fix .env and run again".
+- Ctrl+C/SIGTERM on the daemon terminates the child and exits without
+  restarting.
 """
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -20,6 +24,18 @@ MAX_LOG_BYTES = 10 * 1024 * 1024
 START_BACKOFF = 2.0
 MAX_BACKOFF = 30.0
 STAYED_UP_RESET_SECONDS = 60.0
+
+# main.py exits with this code when its critical startup checks fail (bad or
+# missing GEMINI_API_KEY etc.). Treat it as a permanent configuration problem,
+# not a crash: restarting would just fail again in a loop.
+EXIT_CONFIG_PROBLEM = 2
+
+
+def _sigterm_handler(signum, frame):
+    """Termination request surfaces as KeyboardInterrupt so the supervisor's
+    existing clean-shutdown path (stop the child, don't restart) handles
+    SIGTERM identically to Ctrl+C."""
+    raise KeyboardInterrupt
 
 
 def rotate_if_large(log_path: str = LOG_PATH) -> None:
@@ -66,6 +82,14 @@ def supervise(cmd: list[str], log, cmd_factory=None) -> None:
             if rc == 0:
                 print("[daemon] child exited cleanly; stopping supervisor")
                 break
+            if rc == EXIT_CONFIG_PROBLEM:
+                message = (
+                    "[daemon] configuration problem, not restarting - "
+                    "fix .env and run again"
+                )
+                print(message)
+                print(message, file=log, flush=True)
+                break
             print(f"[daemon] child crashed (code {rc}); restarting in {delay:.0f}s")
             print(
                 f"[daemon] restarting in {delay:.0f}s",
@@ -86,6 +110,7 @@ def supervise(cmd: list[str], log, cmd_factory=None) -> None:
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _sigterm_handler)
     os.makedirs(LOG_DIR, exist_ok=True)
     rotate_if_large()
     with open(LOG_PATH, "a", encoding="utf-8") as log:

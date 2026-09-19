@@ -1,6 +1,6 @@
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from tools.registry import RiskTier, ToolRegistry, ToolSpec
 from tools.roles import has_permission, role_for_actor
@@ -11,6 +11,40 @@ PENDING_TIMEOUT_SECONDS = 45
 
 # Fixed set of affirmative responses accepted for WRITE-tier confirmation.
 _AFFIRMATIVES = frozenset({"yes", "yeah", "confirm", "do it", "go ahead"})
+
+# Lightweight basic-type checks for declared parameter types. This is not a
+# full JSON Schema validator - just enough to catch a model that omits a
+# required argument or passes a plainly wrong kind of value, so those mistakes
+# fail loudly instead of surfacing deep inside a handler.
+_BASIC_TYPE_CHECKS = {
+    "string": lambda value: isinstance(value, str),
+    "boolean": lambda value: isinstance(value, bool),
+    "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
+    "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
+}
+
+
+def _check_args(spec: ToolSpec, args: dict) -> None:
+    """Reject clearly-invalid tool arguments before a handler runs.
+
+    Raises ``ValueError`` when a required key is missing or a present value
+    fails its declared basic type check.
+    """
+    parameters = spec.parameters or {}
+    properties = parameters.get("properties") or {}
+    for key in parameters.get("required") or []:
+        if key not in args:
+            raise ValueError(
+                f"Tool {spec.name!r} is missing required argument {key!r}"
+            )
+    for key, value in args.items():
+        declared_type = (properties.get(key) or {}).get("type")
+        check = _BASIC_TYPE_CHECKS.get(declared_type)
+        if check is not None and not check(value):
+            raise ValueError(
+                f"Tool {spec.name!r} argument {key!r} must be a "
+                f"{declared_type}, got {type(value).__name__}"
+            )
 
 CONFIRM_ACTION_DECLARATION = {
     "name": "confirm_action",
@@ -37,15 +71,36 @@ class PolicyEngine:
     WRITE/SENSITIVE actions through a single pending-confirmation flow.
 
     ``get_recognized`` is a ``Callable[[], bool]`` supplied by main.py,
-    backed by the most recent speaker recognition result.
+    backed by the most recent speaker recognition result. ``get_freshly_recognized``
+    is the same signal with a much shorter window: confirming a pending action
+    requires evidence from right now, not stale trust from earlier in the session.
     """
 
     def __init__(
-        self, registry: ToolRegistry, get_recognized: Callable[[], bool]
+        self,
+        registry: ToolRegistry,
+        get_recognized: Callable[[], bool],
+        get_freshly_recognized: Callable[[], bool],
+        wait_for_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._registry = registry
         self._get_recognized = get_recognized
+        self._get_freshly_recognized = get_freshly_recognized
+        self._wait_for_pending = wait_for_pending
         self._pending: dict | None = None
+
+    async def _dispatch(self, spec: ToolSpec, args: dict) -> dict:
+        """Run the handler directly (READ/TRIVIAL) or stage a confirmation
+        (WRITE/SENSITIVE), after the permission check has already passed."""
+        _check_args(spec, args)
+        logger.info("Tool %r called", spec.name)
+        if spec.risk_tier in (RiskTier.READ, RiskTier.TRIVIAL):
+            # Both tiers run the handler directly — no confirmation pending
+            # state. The permission check above still gates them: unknown is
+            # denied for TRIVIAL (owner-only, confirmation-free), as well as
+            # WRITE/SENSITIVE.
+            return await spec.handler(**args)
+        return self._store_pending(spec, args)
 
     def wrap_handler(self, spec: ToolSpec):
         """Return the function registered with the voice provider for spec.name."""
@@ -53,29 +108,43 @@ class PolicyEngine:
         async def handler(**args) -> dict:
             role = role_for_actor(self._get_recognized())
             if not has_permission(role, spec.risk_tier):
+                if (
+                    spec.risk_tier != RiskTier.READ
+                    and self._wait_for_pending is not None
+                ):
+                    # A recognition for this very utterance may still be
+                    # scoring in the background - most likely with the first
+                    # thing said in a session. Give it exactly one bounded
+                    # wait, then re-check before finalizing the denial. One
+                    # wait, not a retry loop: bounded latency, not
+                    # unbounded patience.
+                    await self._wait_for_pending()
+                    role = role_for_actor(self._get_recognized())
+                    if has_permission(role, spec.risk_tier):
+                        return await self._dispatch(spec, args)
                 logger.info(
                     "Tool %r denied for role %r (tier=%s)",
                     spec.name, role, spec.risk_tier.value,
                 )
                 return {"error": "not permitted"}
-
-            if spec.risk_tier in (RiskTier.READ, RiskTier.TRIVIAL):
-                # Both tiers run the handler directly — no confirmation
-                # pending state. The permission check above still gates them:
-                # unknown is denied for TRIVIAL (owner-only, confirmation-free),
-                # as well as WRITE/SENSITIVE.
-                return await spec.handler(**args)
-
-            return self._store_pending(spec, args)
+            return await self._dispatch(spec, args)
 
         return handler
 
     def _store_pending(self, spec: ToolSpec, args: dict) -> dict:
         if self._pending is not None:
+            # Never silently discard a proposed action for a new one: that
+            # would let a second request wipe out the first before the owner
+            # ever gets a chance to confirm it. The slot must be cleared
+            # through confirm_action (a deny/cancel response) first.
             logger.info(
-                "Replacing pending action %r with new %r request",
+                "Refusing to replace pending action %r with %r request",
                 self._pending["tool_name"], spec.name,
             )
+            return {
+                "error": "another action is already pending confirmation",
+                "pending_tool": self._pending["tool_name"],
+            }
         if spec.risk_tier == RiskTier.SENSITIVE:
             phrase = spec.confirmation_phrase or "confirm"
             self._pending = {
@@ -83,7 +152,7 @@ class PolicyEngine:
                 "args": args,
                 "risk_tier": spec.risk_tier,
                 "required_confirmation": phrase,
-                "created_at": time.time(),
+                "created_at": time.monotonic(),
             }
             return {
                 "status": "confirmation_required",
@@ -94,7 +163,7 @@ class PolicyEngine:
             "args": args,
             "risk_tier": spec.risk_tier,
             "required_confirmation": "yes",
-            "created_at": time.time(),
+            "created_at": time.monotonic(),
         }
         return {
             "status": "confirmation_required",
@@ -106,7 +175,7 @@ class PolicyEngine:
         pending = self._pending
         if pending is None:
             return {"error": "nothing pending"}
-        if time.time() - pending["created_at"] > PENDING_TIMEOUT_SECONDS:
+        if time.monotonic() - pending["created_at"] > PENDING_TIMEOUT_SECONDS:
             self._pending = None
             logger.info(
                 "Pending action %r expired without confirmation", pending["tool_name"]
@@ -116,7 +185,19 @@ class PolicyEngine:
         # Re-check the actor's permission now, not just when the action was
         # first proposed: the person confirming must still be authorized.
         # Someone who merely overheard the phrase shouldn't complete it.
+        # Confirmation additionally demands a recognition that is genuinely
+        # FRESH (get_freshly_recognized) - stale trust from earlier in the
+        # session isn't good enough to approve a write. Either way, give an
+        # in-flight recognition for the confirmation utterance one bounded
+        # wait before finalizing a denial (one wait, not a retry loop).
         role = role_for_actor(self._get_recognized())
+        fresh = self._get_freshly_recognized()
+        if not has_permission(role, pending["risk_tier"]) or not fresh:
+            if self._wait_for_pending is not None:
+                await self._wait_for_pending()
+            role = role_for_actor(self._get_recognized())
+            fresh = self._get_freshly_recognized()
+
         if not has_permission(role, pending["risk_tier"]):
             self._pending = None
             logger.info(
@@ -124,6 +205,18 @@ class PolicyEngine:
                 pending["tool_name"], role, pending["risk_tier"].value,
             )
             return {"error": "not permitted"}
+
+        if not fresh:
+            # Keep the pending action in place so a fresh confirmation
+            # attempt can still complete it once a new recognition lands.
+            logger.info(
+                "Pending action %r denied: confirmation requires a fresh recognition",
+                pending["tool_name"],
+            )
+            return {
+                "error": "not permitted",
+                "reason": "confirmation requires a fresh recognition",
+            }
 
         if pending["risk_tier"] == RiskTier.SENSITIVE:
             affirmed = pending["required_confirmation"].lower() in response_text
@@ -143,6 +236,7 @@ class PolicyEngine:
             logger.error("Pending action %r has no registered spec", pending["tool_name"])
             return {"error": "no such tool"}
         logger.info("Confirmed executing %r", spec.name)
+        _check_args(spec, pending["args"])
         return await spec.handler(**pending["args"])
 
     def declarations(self) -> list[dict]:
