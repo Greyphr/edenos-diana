@@ -13,9 +13,11 @@ import sys
 import threading
 import time
 
+import numpy as np
 import sounddevice as sd
 
 from identity.embeddings import EmbeddingExtractor
+from identity.recognition import cosine_similarity
 from identity.vad import SAMPLE_RATE, UtteranceVAD
 from identity.voiceprint_store import VoiceprintStore
 
@@ -24,6 +26,11 @@ logger = logging.getLogger(__name__)
 CHUNK_SAMPLES = 1024
 CAPTURE_TIMEOUT_SECONDS = 15.0
 MIN_PHRASE_SECONDS = 0.5
+
+# Minimum pairwise cosine similarity between captured phrases before an
+# enrollment is trusted. Below this, at least two phrases were almost
+# certainly not from the same speaker - ask before saving a muddled average.
+AGREEMENT_MIN_SIMILARITY = 0.6
 
 PHRASES = [
     "This is my voice, and Eden will know it.",
@@ -43,6 +50,25 @@ def capture_one_phrase(vad, stream, capturer) -> bytes | None:
         data, _overflowed = stream.read(CHUNK_SAMPLES)
         vad.process(data.tobytes())
     return capturer.audio
+
+
+def minimum_pairwise_similarity(
+    embeddings: list[np.ndarray],
+) -> tuple[float, int, int] | None:
+    """Least-similar pair of collected embeddings: (similarity, i, j).
+
+    Returns None when fewer than two embeddings were collected, so a single-
+    phrase enrollment has nothing to disagree with.
+    """
+    if len(embeddings) < 2:
+        return None
+    worst = None
+    for i in range(len(embeddings)):
+        for j in range(i + 1, len(embeddings)):
+            sim = cosine_similarity(embeddings[i], embeddings[j])
+            if worst is None or sim < worst[0]:
+                worst = (sim, i, j)
+    return worst
 
 
 class _Capturer:
@@ -132,7 +158,45 @@ def main() -> None:
         print("\nEnrollment cancelled.")
         sys.exit(1)
 
+    # Before averaging: if the two phrases that agree least are still far apart,
+    # the capture is suspect (a different speaker, or wildly shifting mic
+    # placement) and the average will be a muddled embedding that recognizes
+    # nobody. Default to NOT saving - redo the capture instead.
+    worst = minimum_pairwise_similarity(embeddings)
+    if worst is not None and worst[0] < AGREEMENT_MIN_SIMILARITY:
+        sim, i, j = worst
+        print()
+        print(
+            f"  Warning: phrases {i + 1} and {j + 1} scored only {sim:.2f} "
+            f"similarity to each other (below {AGREEMENT_MIN_SIMILARITY:.1f})."
+        )
+        print("  Those two phrases may not have been spoken by the same person.")
+        answer = input(
+            "Some phrases sounded inconsistent - save anyway? [y/N] "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print("Enrollment cancelled - nothing was saved.")
+            sys.exit(1)
+
     combined = store.average_embeddings(embeddings)
+
+    # Never silently replace an existing voiceprint: warn and require an
+    # explicit yes, archiving the old profile first (same recovery path
+    # reenroll_voice uses) so it isn't destroyed by the overwrite.
+    if name in store.list_profiles():
+        print()
+        print(f"  Warning: a voiceprint for \"{name}\" already exists.")
+        answer = input(
+            f"A voiceprint for '{name}' already exists - overwrite? [y/N] "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print("Enrollment cancelled - existing voiceprint kept.")
+            sys.exit(1)
+        archived = store.archive_profile(name)
+        if archived:
+            print(f"  Archived the previous voiceprint to:")
+            print(f"    {archived}")
+
     store.save_profile(name, combined)
     print()
     print(f"Voiceprint for \"{name}\" saved to:")
