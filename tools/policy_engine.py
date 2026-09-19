@@ -214,7 +214,10 @@ class PolicyEngine:
             logger.info(
                 "Pending action %r expired without confirmation", pending["tool_name"]
             )
-            return {"status": "cancelled"}
+            return {
+                "status": "cancelled",
+                "tool_name": pending["tool_name"],
+            }
 
         # Re-check the actor's permission now, not just when the action was
         # first proposed: the person confirming must still be authorized.
@@ -238,7 +241,10 @@ class PolicyEngine:
                 "Pending action %r denied for role %r (tier=%s) at confirmation",
                 pending["tool_name"], role, pending["risk_tier"].value,
             )
-            return {"error": "not permitted"}
+            return {
+                "error": "not permitted",
+                "tool_name": pending["tool_name"],
+            }
 
         if not fresh:
             # Keep the pending action in place so a fresh confirmation
@@ -249,6 +255,7 @@ class PolicyEngine:
             )
             return {
                 "error": "not permitted",
+                "tool_name": pending["tool_name"],
                 "reason": "confirmation requires a fresh recognition",
             }
 
@@ -263,15 +270,19 @@ class PolicyEngine:
                 "Pending action %r denied by owner response %r",
                 pending["tool_name"], response_text,
             )
-            return {"status": "cancelled"}
+            return {
+                "status": "cancelled",
+                "tool_name": pending["tool_name"],
+            }
 
         spec = self._registry.get(pending["tool_name"])
         if spec is None:
             logger.error("Pending action %r has no registered spec", pending["tool_name"])
-            return {"error": "no such tool"}
+            return {"error": "no such tool", "tool_name": pending["tool_name"]}
         logger.info("Confirmed executing %r", spec.name)
         _check_args(spec, pending["args"])
-        return await spec.handler(**pending["args"])
+        result = await spec.handler(**pending["args"])
+        return {**result, "tool_name": spec.name}
 
     async def confirm_action(self, response: str = "", **extra) -> dict:
         """Explicit tool-call path to confirming a pending action.
