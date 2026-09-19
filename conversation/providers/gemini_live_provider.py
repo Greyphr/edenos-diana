@@ -66,12 +66,11 @@ class GeminiLiveProvider(VoiceProvider):
         # the previous session instead of starting fresh (Live connections
         # end after ~10 minutes, which shouldn't cost the whole conversation).
         self._resumption_handle: str | None = None
-        # Whether the connected API mode supports server-side session
-        # resumption. Gemini Enterprise mode does; the Developer API rejects
-        # the transparent parameter outright, so _open_session flips this off
-        # for the whole process on first connect and falls back to fresh
-        # sessions (which matches pre-resumption behavior exactly).
-        self._resumption_transparent: bool = True
+        # Whether to send the transparent flag on session resumption. It is
+        # never attempted: the Developer API rejects the transparent
+        # parameter outright, and handle-based (non-transparent) resumption
+        # already works there without it.
+        self._resumption_transparent: bool = False
         # Set by the GoAway handler to tell the receive loop to stop iterating
         # the dying session iterator after the proactive reconnect finishes.
         self._reconnect_now = False
@@ -157,16 +156,13 @@ class GeminiLiveProvider(VoiceProvider):
                 sliding_window=types.SlidingWindow()
             ),
         }
-        if self._resumption_transparent:
-            # Resume the previous session when we hold a handle (None handle
-            # starts a fresh session). transparent=True makes the server send
-            # last_consumed_client_message_index so reconnections can resume
-            # mid-turn seamlessly. Only supported on Gemini Enterprise Agent
-            # Platform mode; the Developer API rejects it and _open_session
-            # detects that on first connect, disabling resumption from then on.
-            config_kwargs["session_resumption"] = types.SessionResumptionConfig(
-                handle=self._resumption_handle, transparent=True
-            )
+        # Resume the previous session when we hold a handle (None handle
+        # starts a fresh session). transparent=True is intentionally NOT
+        # sent: the Developer API rejects it on every connect, while
+        # handle-based resumption works there without it.
+        config_kwargs["session_resumption"] = types.SessionResumptionConfig(
+            handle=self._resumption_handle
+        )
         config = types.LiveConnectConfig(**config_kwargs)
         try:
             self._session_ctx = self._client.aio.live.connect(model=model, config=config)
