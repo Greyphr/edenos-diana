@@ -48,6 +48,7 @@ class GeminiLiveProvider(VoiceProvider):
         self._session = None
         self._session_ctx = None
         self._audio_callback: Callable[[bytes], None] | None = None
+        self._input_transcript_callback: Callable[[str], None] | None = None
         self._interrupted_callback: Callable[[], None] | None = None
         self._disconnected_callback: Callable[[], None] | None = None
         # Called with a bool after a mid-session reconnect: True when the
@@ -138,6 +139,12 @@ class GeminiLiveProvider(VoiceProvider):
             "response_modalities": ["AUDIO"],
             "system_instruction": args["system_instruction"],
             "tools": tools,
+            # Stream the user's speech back as text so the policy checker can
+            # resolve a pending action from the confirmation phrase the owner
+            # actually says - a second, parallel path to the explicit tool
+            # call. Only the finalized transcript is surfaced; interim
+            # (partial-utterance) fragments are dropped in _handle_response.
+            "input_audio_transcription": types.AudioTranscriptionConfig(),
             "speech_config": types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -245,6 +252,23 @@ class GeminiLiveProvider(VoiceProvider):
                 self._interrupted_callback()
             return
 
+        if response.server_content and response.server_content.input_transcription:
+            # A finalized speech-to-text event for what the owner said.
+            # Only settled transcriptions surface (the server also emits
+            # interim fragments on its own field; those are ignored here, and
+            # the callback contract only receives finalized text). Dispatched
+            # off the receive hot path so a slow policy decision can't stall
+            # audio/interruption handling.
+            transcription = response.server_content.input_transcription
+            if (
+                transcription.text
+                and self._input_transcript_callback
+                and transcription.finished
+            ):
+                text = transcription.text
+                asyncio.create_task(self._dispatch_input_transcript(text))
+            return
+
         if response.server_content and response.server_content.model_turn:
             for part in response.server_content.model_turn.parts:
                 if part.inline_data and isinstance(part.inline_data.data, bytes):
@@ -263,6 +287,25 @@ class GeminiLiveProvider(VoiceProvider):
     def _cancel_active_tool_tasks(self) -> None:
         for task in list(self._active_tool_tasks):
             task.cancel()
+
+    async def _dispatch_input_transcript(self, text: str) -> None:
+        """Run an owner-input transcript through the registered callback.
+
+        Deliberately off the receive hot path: the policy engine this feeds
+        makes its own recognition/permission decisions and may await a
+        freshly-recognized actor, so it must never stall audio or
+        interruption handling. Only finalized transcripts arrive here (the
+        dispatch branch filters on ``finished``), matching the provider
+        contract that interim fragments are never surfaced.
+        """
+        if not self._input_transcript_callback:
+            return
+        try:
+            self._input_transcript_callback(text)
+        except Exception as e:
+            # Policy decisions are advisory to the voice loop; a failing
+            # check must never take down the session with it.
+            logger.warning("input transcript callback failed: %r", e)
 
     async def _handle_disconnect(
         self, error: Exception | None, notify_disconnect: bool = True
@@ -391,11 +434,32 @@ class GeminiLiveProvider(VoiceProvider):
     def on_interrupted(self, callback: Callable[[], None]) -> None:
         self._interrupted_callback = callback
 
+    def on_input_transcript(self, callback: Callable[[str], None]) -> None:
+        self._input_transcript_callback = callback
+
     def on_disconnected(self, callback: Callable[[], None]) -> None:
         self._disconnected_callback = callback
 
     def on_reconnected(self, callback: Callable[[bool], None]) -> None:
         self._reconnected_callback = callback
+
+    async def send_status_note(self, text: str) -> None:
+        """Inject an owner-facing status line into the live session."""
+        session = self._session
+        if session is None:
+            logger.warning("Dropping status note; no open session: %r", text[:40])
+            return
+        try:
+            await session.send_realtime_input(
+                text=(
+                    "[System: "
+                    + text
+                    + "]  "
+                    + "This is an automated system message, not the owner speaking. Continue."
+                )
+            )
+        except Exception as e:
+            logger.warning("Failed to send status note: %r", e)
 
     async def wait_for_session(self) -> None:
         if self._receive_task is None:

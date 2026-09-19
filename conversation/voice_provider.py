@@ -40,6 +40,31 @@ class VoiceProvider(ABC):
         """Register the callback invoked when the model reply is interrupted."""
 
     @abstractmethod
+    def on_input_transcript(self, callback: Callable[[str], None]) -> None:
+        """Register the callback invoked for each finalized input transcription.
+
+        The callback receives the finalized text of what the owner actually
+        said. Interim (partial-utterance) fragments are never surfaced: the
+        receiver only sees a complete, settled transcript. This is driven by
+        the server-side ``input_audio_transcription`` config; the callback
+        runs synchronously, so the provider must dispatch it off its receive
+        hot path (e.g. via ``asyncio.create_task``).
+        """
+
+    @abstractmethod
+    async def send_status_note(self, text: str) -> None:
+        """Inject an owner-visible status line into the live session.
+
+        The note is surfaced as a brief client turn (a ``[System: ...]``
+        part), so the owner hears/spies it the same way they hear any other
+        conversational turn. Used to acknowledge things that happen in the
+        background of the voice session — e.g. reporting the outcome of a
+        spoken confirmation that was resolved through the transcript path.
+        Providers should ignore the note (and log a warning) when no session
+        is currently open, rather than raising.
+        """
+
+    @abstractmethod
     def on_disconnected(self, callback: Callable[[], None]) -> None:
         """Register the callback invoked when the session is lost mid-conversation.
 

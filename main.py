@@ -264,6 +264,43 @@ async def run():
         provider.on_interrupted(audio.clear_queue)
         provider.on_disconnected(on_disconnected)
         provider.on_reconnected(on_reconnected)
+
+        # Finalized input speech feeds the *same* pending-confirmation queue the
+        # explicit confirm_action tool call does, via the ABC's parallel
+        # transcript path. Registration mirrors the other callback registers so
+        # the two confirmation channels (spoken vs. tool call) race on equal
+        # footing; whichever resolves the pending action first wins.
+        #
+        # NOTE: the handlers are defined *first* (below) and registered only
+        # after both ``def``s have run, so the closure name is bound by the
+        # time the provider stores the callback. Registering an as-yet-def'd
+        # name would raise NameError on the very line that wires the path.
+        def on_owner_input(transcript: str):
+            # Second, parallel confirmation path: a *finalized* transcript of
+            # what the owner actually said either carries a pending action's
+            # confirmation phrase or settles it. Deliberately dispatched off
+            # the receive hot path so a slow policy decision can never stall
+            # audio/interruption handling. ``check_transcript`` resolves the
+            # same pending queue ``confirm_action`` does, so whichever channel
+            # confirms first wins and the other correctly reports nothing
+            # pending.
+            asyncio.create_task(resolve_from_transcript(transcript))
+
+        async def resolve_from_transcript(transcript: str):
+            result = await policy.check_transcript(transcript)
+            if result is None:
+                # Nothing was pending (or no finalized path needed us).
+                return
+            # Surface the outcome out loud via the session's own channel, so
+            # the owner hears the same ack as a tool-confirmation reply instead
+            # of wondering why the model fell silent.
+            status = result.get("status") or (
+                "done" if "error" not in result else "failed"
+            )
+            if result.get("tool_name"):
+                await provider.send_status_note(
+                    f"{result['tool_name']} - {status}"
+                )
         await provider.start_session(
             build_system_instruction(config, memory_context, confirmation_tools=True),
             config,

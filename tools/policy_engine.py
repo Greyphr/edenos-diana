@@ -190,11 +190,25 @@ class PolicyEngine:
             )
             self._pending = None
 
-    async def confirm_action(self, response: str = "", **extra) -> dict:
-        response_text = (response or "").strip().lower()
+    async def _try_resolve_pending(self, response_text: str) -> dict | None:
+        """Shared confirmation-resolution core for the policy engine.
+
+        ``response_text`` is the owner's actual response to a pending
+        confirmation — either the explicit phrase passed into
+        ``confirm_action`` or a finalized input transcript that carried the
+        confirmation words (the parallel transcript path). Returns ``None``
+        when there is nothing pending, and a resolution dict otherwise (a
+        denial/expiry/cancel marker or the awaited tool-handler result).
+
+        The permissions being re-checked are identical whichever path got us
+        here: whoever confirms — spoken or via tool call — must still be an
+        authorized actor *right now* and back it with a genuinely fresh
+        recognitionate confirmation window.
+        """
+        if self._pending is None:
+            return None
+        response_text = (response_text or "").strip().lower()
         pending = self._pending
-        if pending is None:
-            return {"error": "nothing pending"}
         if time.monotonic() - pending["created_at"] > PENDING_TIMEOUT_SECONDS:
             self._pending = None
             logger.info(
@@ -258,6 +272,32 @@ class PolicyEngine:
         logger.info("Confirmed executing %r", spec.name)
         _check_args(spec, pending["args"])
         return await spec.handler(**pending["args"])
+
+    async def confirm_action(self, response: str = "", **extra) -> dict:
+        """Explicit tool-call path to confirming a pending action.
+
+        Thin wrapper over the shared resolution core: the tool-call surface
+        keeps its ``{"error": "nothing pending"}`` channel while delegating
+        the actual permission/freshness/affirmation logic to
+        ``_try_resolve_pending`` so the transcript path stays identical.
+        """
+        result = await self._try_resolve_pending(response)
+        if result is None:
+            return {"error": "nothing pending"}
+        return result
+
+    async def check_transcript(self, transcript: str) -> dict | None:
+        """Resolve a pending action from a finalized input transcript.
+
+        The second, parallel path to confirming: instead of the model issuing
+        an explicit ``confirm_action`` tool call, the owner's spoken
+        confirmation is transcribed by the voice session and checked here
+        against whatever is pending. Returns ``None`` when there was nothing
+        to resolve (or the transcript side had no pending action); otherwise
+        the resolution dict from ``_try_resolve_pending`` — the caller may
+        then acknowledge the outcome out loud.
+        """
+        return await self._try_resolve_pending(transcript)
 
     def declarations(self) -> list[dict]:
         declarations = self._registry.all_declarations()
