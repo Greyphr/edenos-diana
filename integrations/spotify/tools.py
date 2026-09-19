@@ -13,7 +13,7 @@ outcome the model should read and respond to.
 
 from tools.registry import RiskTier, ToolSpec
 
-from .client import NoActiveDeviceError
+from .client import NoActiveDeviceError, SpotifyClient
 
 _PLAY_PARAMETERS = {
     "type": "object",
@@ -32,7 +32,7 @@ def _no_active_device_result(exc: NoActiveDeviceError) -> dict:
     """Turn the client's no-device error into a normal tool result, keeping
     its specific message (no devices vs. inactive devices) and the device
     list so the model can tell the owner which situation it is."""
-    result = {
+    result: dict[str, object] = {
         "error": "no_active_device",
         "message": str(exc)
         or "No active Spotify device - open Spotify on a device and try again.",
@@ -42,7 +42,7 @@ def _no_active_device_result(exc: NoActiveDeviceError) -> dict:
     return result
 
 
-def make_spotify_specs(client) -> list[ToolSpec]:
+def make_spotify_specs(client: SpotifyClient) -> list[ToolSpec]:
     async def _play(**args) -> dict:
         query = (args.get("query") or "").strip()
         if not query:
@@ -97,6 +97,14 @@ def make_spotify_specs(client) -> list[ToolSpec]:
 
     async def _set_volume(**args) -> dict:
         percent = args.get("percent")
+        # The declared schema is integer 0-100 and the policy engine validates
+        # it before handlers run, but a direct call must not pass through a
+        # None/non-integer into the Web API query string.
+        if not isinstance(percent, int) or isinstance(percent, bool):
+            return {
+                "error": "bad_percent",
+                "message": "Volume percent must be an integer (0-100).",
+            }
         try:
             await client.set_volume(percent)
         except NoActiveDeviceError as exc:
