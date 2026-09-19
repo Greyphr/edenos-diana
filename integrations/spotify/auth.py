@@ -16,6 +16,7 @@ always-on main loop never needs browser interactivity.
 import json
 import logging
 import os
+import secrets
 import sys
 import threading
 import urllib.parse
@@ -39,16 +40,21 @@ SCOPES = (
 VAULT_KEY_NAME = "spotify_refresh_token"
 
 
-def build_authorize_url(client_id: str, redirect_uri: str, scopes: str = SCOPES) -> str:
-    params = urllib.parse.urlencode(
-        {
-            "client_id": client_id,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": scopes,
-        }
-    )
-    return f"{AUTHORIZE_URL}?{params}"
+def build_authorize_url(
+    client_id: str, redirect_uri: str, scopes: str = SCOPES, state: str | None = None
+) -> str:
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": scopes,
+    }
+    # OAuth state: echoed back by Spotify in the callback so we can tell the
+    # redirect came from a request we initiated, not a spoofed one.
+    if state:
+        params["state"] = state
+    query = urllib.parse.urlencode(params)
+    return f"{AUTHORIZE_URL}?{query}"
 
 
 def exchange_code_for_tokens(
@@ -77,8 +83,11 @@ def store_refresh_token(tokens: dict, vault: Vault) -> str:
     """Persist the refresh token from a token response. Raises if absent."""
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
+        # Never dump the raw dict: it may contain a live access_token.
+        error = tokens.get("error") or "unknown_error"
+        description = tokens.get("error_description") or "no error description returned"
         raise RuntimeError(
-            f"Token response had no refresh_token: {tokens.get('error') or tokens}"
+            f"Token response had no refresh_token: {error}: {description}"
         )
     vault.set(VAULT_KEY_NAME, refresh_token)
     return refresh_token
@@ -88,20 +97,46 @@ class _CallbackHandler(BaseHTTPRequestHandler):
     """Captures the code Spotify redirects to the local callback URI."""
 
     captured_code: str | None = None
+    expected_state: str | None = None
+    reject_reason: str | None = None
+
+    def _reject(self, reason: str) -> None:
+        self.__class__.reject_reason = reason
+        body = f"{reason}: {self.path}".encode()
+        self.send_response(400)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         code = params.get("code", [None])[0]
-        if code:
+        state = params.get("state", [None])[0]
+
+        if self.__class__.expected_state is not None:
+            if state != self.__class__.expected_state:
+                self._reject(
+                    "State parameter is missing or does not match - callback rejected"
+                )
+            elif not code:
+                self._reject("Missing code in callback")
+            else:
+                self.__class__.captured_code = code
+                body = b"Authorization complete - you can close this tab."
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(body)
+        elif code:
             self.__class__.captured_code = code
+            body = b"Authorization complete - you can close this tab."
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Authorization complete - you can close this tab.")
-        else:
-            self.send_response(400)
-            self.end_headers()
-            body = f"Missing code in callback: {self.path}".encode()
             self.wfile.write(body)
+        else:
+            self._reject("Missing code in callback")
+
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def log_message(self, format, *args):  # noqa: A002 - BaseHTTPRequestHandler API
@@ -112,7 +147,7 @@ def main() -> None:
     load_dotenv()
     client_id = os.getenv("SPOTIFY_CLIENT_ID", "")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
 
     missing = [
         name
@@ -138,7 +173,10 @@ def main() -> None:
         sys.exit(1)
 
     _CallbackHandler.captured_code = None
-    authorize_url = build_authorize_url(client_id, redirect_uri)
+    _CallbackHandler.reject_reason = None
+    state = secrets.token_urlsafe(16)
+    _CallbackHandler.expected_state = state
+    authorize_url = build_authorize_url(client_id, redirect_uri, state=state)
     print("Open this URL in your browser (it should have opened):")
     print("  " + authorize_url)
     webbrowser.open(authorize_url)
@@ -166,7 +204,15 @@ def main() -> None:
 
     code = _CallbackHandler.captured_code
     if code is None:
-        print("No authorization code received. Try again.")
+        reason = _CallbackHandler.reject_reason
+        if reason:
+            print(
+                f"Callback rejected: {reason}. "
+                "Make sure the authorization page came from this run's URL "
+                "and try again."
+            )
+        else:
+            print("No authorization code received. Try again.")
         sys.exit(1)
 
     print("Exchanging the code for a refresh token...")

@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 VAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vault_data")
 VAULT_FILE = os.path.join(VAULT_DATA_DIR, "secrets.enc.json")
 
+# Example/placeholder keys that have shipped in .env.example and therefore
+# must never be used for real secrets. Defense in depth in case someone
+# copies .env.example to .env without reading the comments.
+KNOWN_LEAKED_EXAMPLE_KEYS = {
+    "TPEdXAFivxXnZi6J2ZAKbzzZb0hFQZqUGWLD_9LmFJs=",
+}
+
 
 class Vault:
     """Fernet-encrypted secrets backed by a single JSON file."""
@@ -36,6 +43,12 @@ class Vault:
                 "Fernet key there (generate one with: "
                 'python -c "from cryptography.fernet import Fernet; '
                 'print(Fernet.generate_key().decode())").'
+            )
+        if key in KNOWN_LEAKED_EXAMPLE_KEYS:
+            raise RuntimeError(
+                "VAULT_KEY is the example key from .env.example, not a real "
+                "one - generate your own (Fernet.generate_key()) and never "
+                "commit it."
             )
         self._fernet = Fernet(key.encode())
         self.file_path = file_path
