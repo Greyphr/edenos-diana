@@ -48,23 +48,29 @@ def make_spotify_specs(client: SpotifyClient) -> list[ToolSpec]:
         if not query:
             return {"error": "missing_query", "message": "No song query provided."}
         try:
-            uri = await client.search_track(query)
-            if uri is None:
+            match = await client.search_track(query)
+            if match is None:
                 return {
                     "status": "not_found",
                     "message": f"No Spotify track found for {query!r}.",
                 }
+            # Report exactly what Spotify *actually* found so the oral
+            # response reflects reality instead of blindly echoing the request.
+            uri = match["uri"]
             # Primary path: launch locally via the OS protocol handler. This
             # works with Spotify fully closed — the launch itself creates the
             # active device that resume/pause/skip/volume then steer. We do
             # NOT additionally call the Web API play() here.
-            await client.launch_track_locally(uri)
+            await client.launch_track_locally(match["uri"])
         except NoActiveDeviceError as exc:
             return _no_active_device_result(exc)
         return {
             "status": "ok",
-            "message": f"Opening {query!r} in the Spotify app.",
-            "track_uri": uri,
+            "message": (
+                f"Opening {match['name']} by {match['artists']} "
+                "in the Spotify app."
+            ),
+            "track_uri": match["uri"],
         }
 
     async def _resume(**args) -> dict:

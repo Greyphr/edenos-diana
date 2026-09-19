@@ -221,16 +221,39 @@ class SpotifyClient:
             "is_playing": bool(data.get("is_playing")),
         }
 
-    async def search_track(self, query: str) -> str | None:
-        """Best-track URI for the query, or None when nothing matched."""
+    async def search_track(self, query: str) -> dict | None:
+        """Best-track match for the query, or None when nothing matched.
+
+        Returns ``{"uri", "name", "artists"}`` (never a bare URI) so callers
+        can say what Spotify *actually* found. ``artists`` joins the artist
+        names exactly like :meth:`get_current_track` does. ``market`` scopes
+        the search to the authenticated user's market (from the token), which
+        improves relevance and avoids surfacing tracks that aren't playable
+        for that user.
+        """
         response = await self._request(
             "GET",
             "/v1/search",
-            params={"q": query, "type": "track", "limit": 1},
+            params={
+                "q": query,
+                "type": "track",
+                "limit": 1,
+                "market": "from_token",
+            },
         )
         response.raise_for_status()
         items = response.json().get("tracks", {}).get("items", [])
-        return items[0].get("uri") if items else None
+        if not items:
+            return None
+        item = items[0]
+        return {
+            "uri": item.get("uri"),
+            "name": item.get("name"),
+            "artists": ", ".join(
+                artist.get("name", "")
+                for artist in item.get("artists", [])
+            ),
+        }
 
     async def launch_track_locally(self, uri: str) -> None:
         """Open a specific track through the OS protocol handler so it plays
