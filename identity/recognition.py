@@ -50,9 +50,22 @@ class SpeakerRecognizer:
         self._vad = UtteranceVAD()
         self._vad.on_utterance = self._on_utterance
         self._callbacks = []
+        # In-flight async scoring tasks; kept so callers can wait on the
+        # current utterance's result instead of judging on nothing yet, and
+        # so the tasks aren't dropped (asyncio.create_task result held here).
+        self._pending_tasks: set[asyncio.Task] = set()
 
     def on_result(self, callback) -> None:
         self._callbacks.append(callback)
+
+    def reset(self) -> None:
+        """Drop any half-scored utterance from the previous session.
+
+        Called on the way back to idle alongside the trust-window reset, so
+        a partially-buffered utterance can't survive into the next engaged
+        session and get stitched onto new audio.
+        """
+        self._vad.reset()
 
     def feed(self, chunk: bytes) -> None:
         """Cheap, non-blocking: append to the VAD buffer. Never scores inline."""
@@ -71,7 +84,21 @@ class SpeakerRecognizer:
             )
             thread.start()
         else:
-            asyncio.create_task(self._score_async(audio))
+            task = asyncio.create_task(self._score_async(audio))
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
+
+    async def wait_for_pending(self, timeout: float = 1.5) -> None:
+        """Wait briefly for any in-flight scoring task to finish.
+
+        Returns immediately when nothing is genuinely pending — either
+        identity has already resolved or there's been no speech at all, so
+        this costs nothing in the common cases.
+        """
+        pending = list(self._pending_tasks)
+        if not pending:
+            return
+        await asyncio.wait(pending, timeout=timeout)
 
     async def _score_async(self, audio: bytes) -> None:
         try:

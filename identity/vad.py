@@ -51,10 +51,19 @@ class UtteranceVAD:
         self.hangover_ms = hangover_ms
         self.max_utterance_ms = max_utterance_ms
         self.on_utterance = None
+        self._floor: float | None = None
         self.reset()
 
     def reset(self) -> None:
-        self._floor: float | None = None
+        """Abandon any utterance in progress.
+
+        Clears the mid-utterance buffer, speech/hangover tracking, and state
+        without discarding the adaptively-learned noise floor — relearning
+        ambience takes seconds of quiet audio, and an idle gap between
+        engaged sessions shouldn't throw it away. Used on the way back to
+        idle so a half-finished utterance buffer from one session can never
+        be stitched onto the first audio of the next.
+        """
         self._state = self.IDLE
         self._buffer = bytearray()
         self._speech_ms = 0
@@ -114,9 +123,7 @@ class UtteranceVAD:
     def _finish_utterance(self) -> None:
         speech_ms = self._speech_ms
         audio = bytes(self._buffer)
-        floor = self._floor
         self.reset()
-        self._floor = floor
         if speech_ms < self.min_utterance_ms:
             logger.debug("discarded %.0f ms as a noise blip", speech_ms)
             return
