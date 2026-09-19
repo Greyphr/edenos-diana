@@ -1,0 +1,6 @@
+# requirements-dev.txt states intent for development-only tooling under the
+# project venv. These are not runtime dependencies of Eden itself; install
+# them with `pip install -r requirements-dev.txt` when working on the code.
+# pyright: static type checker (the engine behind Pylance in VS Code), run
+# from the command line. Config lives in pyrightconfig.json at the repo root.
+pyright>=1.1.390
