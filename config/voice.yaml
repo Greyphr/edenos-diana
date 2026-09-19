@@ -1,4 +1,5 @@
 provider: gemini_live
+model: gemini-3.1-flash-live-preview
 voice_name: Puck
 language_code: en-US
 personality:

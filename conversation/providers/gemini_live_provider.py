@@ -1,5 +1,3 @@
-# Model: gemini-3.1-flash-live-preview
-# (current low-latency Live/native-audio model as of Sept 2026, per Google docs)
 import asyncio
 import logging
 import os
@@ -12,7 +10,9 @@ from conversation.voice_provider import VoiceProvider
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-3.1-flash-live-preview"
+# Fallback Live/native-audio model when config/voice.yaml omits "model".
+# The live model name is overridable per-config (no code change needed).
+DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 
 # Initial-connection smoothing: a transient blip at startup shouldn't fail the
 # whole boot, so retry a few times with a short fixed delay before giving up.
@@ -50,7 +50,10 @@ class GeminiLiveProvider(VoiceProvider):
         self._audio_callback: Callable[[bytes], None] | None = None
         self._interrupted_callback: Callable[[], None] | None = None
         self._disconnected_callback: Callable[[], None] | None = None
-        self._reconnected_callback: Callable[[], None] | None = None
+        # Called with a bool after a mid-session reconnect: True when the
+        # resumption handle was carried over (conversation survived the drop),
+        # False when the new connection started fresh.
+        self._reconnected_callback: Callable[[bool], None] | None = None
         self._tool_handlers: dict[str, Callable] = {}
         self._receive_task: asyncio.Task | None = None
         # In-flight tool-call tasks, dispatched off the receive loop so one
@@ -131,6 +134,7 @@ class GeminiLiveProvider(VoiceProvider):
         tools = None
         if args["tool_declarations"]:
             tools = [{"function_declarations": list(args["tool_declarations"])}]
+        model = args["voice_config"].get("model") or DEFAULT_MODEL
         config_kwargs = {
             "response_modalities": ["AUDIO"],
             "system_instruction": args["system_instruction"],
@@ -142,6 +146,15 @@ class GeminiLiveProvider(VoiceProvider):
                     )
                 ),
                 language_code=args["voice_config"]["language_code"],
+            ),
+            # Sliding-window context compression rolls the transcript over so
+            # a session can keep going past the token-based ~15-minute audio
+            # cap indefinitely. This is orthogonal to the connection-level
+            # resumption worked on earlier (that re-attaches to a fresh
+            # connection; this stops the conversation from running out of
+            # context in the first place).
+            "context_window_compression": types.ContextWindowCompressionConfig(
+                sliding_window=types.SlidingWindow()
             ),
         }
         if self._resumption_transparent:
@@ -156,7 +169,7 @@ class GeminiLiveProvider(VoiceProvider):
             )
         config = types.LiveConnectConfig(**config_kwargs)
         try:
-            self._session_ctx = self._client.aio.live.connect(model=MODEL, config=config)
+            self._session_ctx = self._client.aio.live.connect(model=model, config=config)
             self._session = await self._session_ctx.__aenter__()
         except ValueError as exc:
             message = str(exc)
@@ -188,8 +201,13 @@ class GeminiLiveProvider(VoiceProvider):
     async def _receive_loop(self):
         while True:
             try:
+                session = self._session
+                if session is None:
+                    raise RuntimeError(
+                        "receive loop started without an open session"
+                    )
                 self._reconnect_now = False
-                async for response in self._session.receive():
+                async for response in session.receive():
                     await self._handle_response(response)
                     if self._reconnect_now:
                         # GoAway handling already swapped in a fresh session;
@@ -380,7 +398,7 @@ class GeminiLiveProvider(VoiceProvider):
     def on_disconnected(self, callback: Callable[[], None]) -> None:
         self._disconnected_callback = callback
 
-    def on_reconnected(self, callback: Callable[[], None]) -> None:
+    def on_reconnected(self, callback: Callable[[bool], None]) -> None:
         self._reconnected_callback = callback
 
     async def wait_for_session(self) -> None:

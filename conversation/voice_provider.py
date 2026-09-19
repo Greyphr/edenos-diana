@@ -49,8 +49,10 @@ class VoiceProvider(ABC):
         """
 
     @abstractmethod
-    def on_reconnected(self, callback: Callable[[], None]) -> None:
-        """Register the callback invoked after a reconnected session is live again."""
+    def on_reconnected(self, callback: Callable[[bool], None]) -> None:
+        """Register the callback invoked after a reconnected session is live
+        again. The callback receives whether the reconnection resumed the
+        previous session (True) or started a fresh one (False)."""
 
     @abstractmethod
     async def wait_for_session(self) -> None:
