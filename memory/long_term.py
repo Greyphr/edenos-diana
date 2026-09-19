@@ -4,8 +4,12 @@ import re
 import time
 
 from memory.store import JsonListStore
+from tools.names import validate_name
 
 logger = logging.getLogger(__name__)
+
+MAX_FACT_LENGTH = 500
+MAX_FACTS = 200
 
 # Small, intentionally short stopword list for recall queries.
 _STOPWORDS = frozenset({
@@ -25,6 +29,7 @@ def _keywords(query: str) -> list[str]:
 
 
 def _data_dir(owner_name: str) -> str:
+    validate_name(owner_name, context="owner name")
     return os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "data", owner_name
     )
@@ -47,7 +52,25 @@ class LongTermMemory:
     def add_fact(self, text: str) -> None:
         facts = self._store.read()
         facts.append({"text": text, "recorded_at": _now_iso()})
+        # Bounded store: when the cap would be exceeded, drop the oldest
+        # entries first so a flood of writes can't silently push out
+        # everything real.
+        if len(facts) > MAX_FACTS:
+            del facts[: len(facts) - MAX_FACTS]
         self._store.write(facts)
+
+    def remove_facts_containing(self, match: str) -> int:
+        """Remove every fact whose text contains ``match`` (case-insensitive).
+
+        Returns how many facts were removed.
+        """
+        needle = match.lower()
+        facts = self._store.read()
+        kept = [fact for fact in facts if needle not in fact["text"].lower()]
+        removed = len(facts) - len(kept)
+        if removed:
+            self._store.write(kept)
+        return removed
 
     def all_facts(self) -> list[dict]:
         # Most recent first.

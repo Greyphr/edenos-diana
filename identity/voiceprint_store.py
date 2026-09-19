@@ -6,6 +6,8 @@ import time
 
 import numpy as np
 
+from tools.names import validate_name
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROFILES_DIR = os.path.join(
@@ -26,6 +28,7 @@ class VoiceprintStore:
         os.makedirs(self.profiles_dir, exist_ok=True)
 
     def save_profile(self, name: str, embedding: np.ndarray) -> dict:
+        validate_name(name, context="profile name")
         profile = {
             "name": name,
             "embedding": [float(x) for x in embedding],
@@ -48,6 +51,7 @@ class VoiceprintStore:
         return profile
 
     def load_profile(self, name: str) -> dict | None:
+        validate_name(name, context="profile name")
         path = os.path.join(self.profiles_dir, f"{name}.json")
         if not os.path.isfile(path):
             return None
@@ -76,6 +80,7 @@ class VoiceprintStore:
         active scan (``os.listdir`` of the root, ``.json`` only) never
         re-reads them as live profiles.
         """
+        validate_name(name, context="profile name")
         path = os.path.join(self.profiles_dir, f"{name}.json")
         if not os.path.isfile(path):
             return None

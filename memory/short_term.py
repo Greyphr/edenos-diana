@@ -4,13 +4,17 @@ import time
 from datetime import datetime, timedelta
 
 from memory.store import JsonListStore
+from tools.names import validate_name
 
 logger = logging.getLogger(__name__)
 
 PRUNE_AFTER_SECONDS = 24 * 60 * 60
+MAX_FACT_LENGTH = 500
+MAX_FACTS = 50
 
 
 def _data_dir(owner_name: str) -> str:
+    validate_name(owner_name, context="owner name")
     return os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "data", owner_name
     )
@@ -35,7 +39,11 @@ class ShortTermMemory:
     def add_fact(self, text: str) -> None:
         entries = self._store.read()
         entries.append({"text": text, "recorded_at": _now_iso()})
-        self._store.write(self._prune(entries))
+        entries = self._prune(entries)
+        # Bounded store: drop the oldest entries once the cap is exceeded.
+        if len(entries) > MAX_FACTS:
+            del entries[: len(entries) - MAX_FACTS]
+        self._store.write(entries)
 
     def all_facts(self) -> list[dict]:
         # Most recent first.

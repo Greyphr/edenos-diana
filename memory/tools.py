@@ -1,5 +1,6 @@
-from memory.long_term import LongTermMemory
+from memory.long_term import MAX_FACT_LENGTH, LongTermMemory
 from memory.short_term import ShortTermMemory
+from tools.registry import RiskTier, ToolSpec
 
 REMEMBER_DECLARATION = {
     "name": "remember",
@@ -36,13 +37,36 @@ RECALL_DECLARATION = {
     },
 }
 
+FORGET_DECLARATION = {
+    "name": "forget",
+    "description": (
+        "Remove a previously remembered fact about the owner whose text "
+        "contains the given string (case-insensitive). Returns how many "
+        "facts were removed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "match": {
+                "type": "string",
+                "description": (
+                    "Text the note must contain (case-insensitive) to be removed."
+                ),
+            }
+        },
+        "required": ["match"],
+    },
+}
 
-def make_memory_handlers(owner_name: str) -> dict:
-    """Build the remember/recall handlers closing over one owner's memory.
+
+def make_memory_handlers(owner_name: str) -> list[ToolSpec]:
+    """Build the remember/recall/forget specs closing over one owner's memory.
 
     ``remember`` writes to both long-term (durable) and short-term (recency
     signal) stores. ``recall`` searches long-term facts and never raises for
-    a no-match query.
+    a no-match query. ``forget`` removes long-term facts whose text contains
+    the given string. All three are TRIVIAL — owner-only, confirmation-free —
+    so they run through the same policy engine as every other tool.
     """
 
     long_term = LongTermMemory(owner_name)
@@ -52,6 +76,13 @@ def make_memory_handlers(owner_name: str) -> dict:
         fact = str(args.get("fact", "")).strip()
         if not fact:
             return {"status": "error", "reason": "empty fact"}
+        if len(fact) > MAX_FACT_LENGTH:
+            return {
+                "status": "error",
+                "reason": (
+                    f"fact too long ({len(fact)} chars, max {MAX_FACT_LENGTH})"
+                ),
+            }
         long_term.add_fact(fact)
         short_term.add_fact(fact)
         return {"status": "ok"}
@@ -65,4 +96,32 @@ def make_memory_handlers(owner_name: str) -> dict:
         ]
         return {"matches": matches}
 
-    return {"remember": remember, "recall": recall}
+    async def forget(**args) -> dict:
+        match = str(args.get("match", "")).strip()
+        if not match:
+            return {"status": "error", "reason": "empty match"}
+        return {"removed": long_term.remove_facts_containing(match)}
+
+    return [
+        ToolSpec(
+            name="remember",
+            description=REMEMBER_DECLARATION["description"],
+            parameters=REMEMBER_DECLARATION["parameters"],
+            risk_tier=RiskTier.TRIVIAL,
+            handler=remember,
+        ),
+        ToolSpec(
+            name="recall",
+            description=RECALL_DECLARATION["description"],
+            parameters=RECALL_DECLARATION["parameters"],
+            risk_tier=RiskTier.TRIVIAL,
+            handler=recall,
+        ),
+        ToolSpec(
+            name="forget",
+            description=FORGET_DECLARATION["description"],
+            parameters=FORGET_DECLARATION["parameters"],
+            risk_tier=RiskTier.TRIVIAL,
+            handler=forget,
+        ),
+    ]
