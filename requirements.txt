@@ -7,8 +7,13 @@ google-genai>=1.0.0
 sounddevice>=0.4.0
 python-dotenv>=1.0.0
 numpy>=1.24.0
-openwakeword>=0.6.0
+# openwakeword>=0.6.0 is installed with `pip install --no-deps` (see
+# .github/workflows/ci.yml): on Linux it declares `tflite-runtime<3,>=2.8.0`,
+# which has no Python 3.14 wheels, and Eden only uses its ONNX inference path
+# (conversation/wake_word.py). Its import-time runtime deps are listed below.
 onnxruntime>=1.17.0
+requests>=2.0.0
+tqdm>=4.0.0
 # resemblyzer pulls in torch — a much larger install than anything else here
 resemblyzer>=0.1.4
 PyYAML>=6.0

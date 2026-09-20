@@ -20,6 +20,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # openwakeword: removed from requirements.txt (see its comment).
+          # --no-deps skips the unresolvable Linux-only tflite-runtime pin.
+          pip install "openwakeword>=0.6.0" --no-deps
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
