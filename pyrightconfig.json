@@ -8,6 +8,7 @@
     "memory",
     "conversation",
     "integrations",
+    "coding_engine",
     "tests"
   ],
   "exclude": ["**/__pycache__"],
