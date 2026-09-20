@@ -4,3 +4,7 @@
 # pyright: static type checker (the engine behind Pylance in VS Code), run
 # from the command line. Config lives in pyrightconfig.json at the repo root.
 pyright>=1.1.390
+# Test suite (tests/): pytest plus ~pytest-asyncio for the async tool handlers
+# (enabled via asyncio_mode = "auto" in pyproject.toml).
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

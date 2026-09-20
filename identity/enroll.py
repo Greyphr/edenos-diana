@@ -20,6 +20,7 @@ import sounddevice as sd
 
 from identity.embeddings import EmbeddingExtractor
 from identity.enrollment_core import enrollment_is_coherent, save_enrollment
+from identity.recognition import cosine_similarity
 from identity.vad import SAMPLE_RATE, UtteranceVAD
 from identity.voiceprint_store import VoiceprintStore
 

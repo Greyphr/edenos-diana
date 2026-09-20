@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# pytest-asyncio: every async test runs on an event loop without needing an
+# explicit @pytest.mark.asyncio on each one.
+asyncio_mode = "auto"
+# Insert the repository root onto sys.path so tests can `import tools`, etc.
+pythonpath = ["."]
+testpaths = ["tests"]

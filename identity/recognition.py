@@ -195,13 +195,14 @@ class SpeakerRecognizer:
         embedding = self._extractor.extract(audio)
         self._enroll_embeddings.append(embedding)
         count = len(self._enroll_embeddings)
+        target = self._enroll_target
         collector = self._enroll_collector_callback
         if collector is not None:
             try:
-                collector(check_count=count, target=self._enroll_target)
+                collector(check_count=count, target=target)
             except Exception:
                 logger.exception("enrollment sample callback raised")
-        if count >= self._enroll_target:
+        if target is not None and count >= target:
             self._enroll_target = None
             completed = self._enroll_embeddings
             self._enroll_embeddings = []

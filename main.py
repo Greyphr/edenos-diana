@@ -253,7 +253,11 @@ async def run():
         ).strip().lower() in ("y", "yes"):
             from integrations.spotify.auth import run_spotify_auth_flow
 
-            if await run_spotify_auth_flow():
+            if await run_spotify_auth_flow(
+                os.getenv("SPOTIFY_CLIENT_ID", ""),
+                os.getenv("SPOTIFY_CLIENT_SECRET", ""),
+                os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"),
+            ):
                 try:
                     spotify_client = SpotifyClient()
                 except Exception as exc2:
