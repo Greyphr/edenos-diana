@@ -135,8 +135,12 @@ class SpeakerRecognizer:
         try:
             result = await asyncio.to_thread(self._score_sync, audio)
         except Exception:
+            # A recognizer exception is not a measurement: building a synthetic
+            # (None, 0.0, False) result here and emitting it would feed the
+            # trust window as though it were a real non-match. Just log and
+            # emit nothing - the same no-result path the too-short case takes.
             logger.exception("Speaker recognition failed for an utterance")
-            result = (None, 0.0, False, None)
+            return
         if result is None:
             return  # too short to score reliably; no result emitted
         self._emit(*result)
@@ -145,8 +149,10 @@ class SpeakerRecognizer:
         try:
             result = self._score_sync(audio)
         except Exception:
+            # See _score_async: never emit a synthetic unrecognized result
+            # from an exception - only genuine measurements reach _emit.
             logger.exception("Speaker recognition failed for an utterance")
-            result = (None, 0.0, False, None)
+            return
         if result is None:
             return  # too short to score reliably; no result emitted
         self._emit(*result)

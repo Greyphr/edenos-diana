@@ -35,6 +35,30 @@ from tools.reasoning_delegate import (
 )
 from tools.reenroll_voice import make_reenroll_voice_spec
 from tools.registry import ToolRegistry
+from tools.web_search import make_web_search_spec
+
+_LOG = logging.getLogger(__name__)
+
+# Dedicated conversation transcript log: its own FileHandler writes ONLY the
+# YOU:/EDEN: dialogue lines to logs/conversation.log, fully isolated from the
+# general app logger (own handler, no propagation) so the file stays a clean
+# readable transcript with nothing else mixed in. Plain-message format only.
+_voicelog = logging.getLogger("eden.voicelog")
+
+
+def _ensure_voicelog_handler() -> None:
+    if _voicelog.handlers:
+        return
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    handler = logging.FileHandler(
+        os.path.join(logs_dir, "conversation.log"), encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    _voicelog.addHandler(handler)
+    _voicelog.setLevel(logging.INFO)
+    _voicelog.propagate = False
+
 
 IDLE_TIMEOUT_SECONDS = 8.0
 # How long a single strong recognition keeps the actor treated as the owner.
@@ -199,6 +223,12 @@ async def run():
             GeminiReasoningProvider(model=config.get("reasoning_model"))
         )
     )
+
+    # Web search (Brave Search API): TRIVIAL tier, owner-only, runs
+    # immediately with no confirmation prompt. Always registered - if
+    # BRAVE_SEARCH_API_KEY is missing the handler returns a clear error dict
+    # instead of raising, so Eden can report that search is unavailable.
+    tool_registry.register(make_web_search_spec())
 
     # Memory tools go through the exact same registry + PolicyEngine as
     # everything else: TRIVIAL tier, owner-only, confirmation-free (same
@@ -438,6 +468,11 @@ async def run():
                     enrolled_name[0] = transcript.strip()
                     print(f"  First-run name heard: {enrolled_name[0]}")
                 return
+            # In normal (non-bootstrap) mode the transcript is always the
+            # owner's words, so the conversation log records it regardless of
+            # whether check_transcript finds anything pending below.
+            if transcript:
+                _voicelog.info("YOU: %s", transcript)
             # Second, parallel confirmation path: a *finalized* transcript of
             # what the owner actually said either carries a pending action's
             # confirmation phrase or settles it. Deliberately dispatched off
@@ -471,6 +506,8 @@ async def run():
         # input registration pattern exactly: only settled, finished
         # transcripts are surfaced, dispatched off the receive hot path.
         def on_owner_output(transcript: str):
+            if transcript:
+                _voicelog.info("EDEN: %s", transcript)
             _LOG.info("Eden said: %s", transcript)
         provider.on_output_transcript(on_owner_output)
 
@@ -482,6 +519,7 @@ async def run():
                 memory_context,
                 confirmation_tools=True,
                 reasoning_tools=True,
+                web_search_tools=True,
                 owner_name=get_owner_name(),
             ),
             config,
@@ -524,6 +562,7 @@ async def run():
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    _ensure_voicelog_handler()
     load_dotenv()
 
     from startup_checks import SEVERITY_CRITICAL, run_startup_checks
