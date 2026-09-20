@@ -24,6 +24,8 @@ from identity.recognition import (
     SpeakerRecognizer,
 )
 from identity.voiceprint_store import VoiceprintStore
+from integrations.calendar.client import CalendarClient
+from integrations.calendar.tools import make_calendar_specs
 from integrations.spotify.client import SpotifyClient
 from integrations.spotify.tools import make_spotify_specs
 from memory.context import build_context_summary
@@ -269,6 +271,47 @@ async def run():
             print(f"(reason: {exc})")
     if spotify_client is not None:
         for spec in make_spotify_specs(spotify_client):
+            tool_registry.register(spec)
+
+    # Google Calendar integration, same optional-at-startup shape as Spotify:
+    # without a stored refresh token (or missing GOOGLE_CLIENT_ID/SECRET) we
+    # skip registering the tools with a one-line notice; when present, specs
+    # go through the same registry + PolicyEngine, so calendar_create_event
+    # (WRITE tier) confirms before running while calendar_get_upcoming
+    # (TRIVIAL tier) answers immediately.
+    try:
+        calendar_client = CalendarClient()
+    except Exception as exc:
+        calendar_client = None
+        if sys.stdin.isatty() and input(
+            "\nGoogle Calendar isn't connected - authorize now? [y/N] "
+        ).strip().lower() in ("y", "yes"):
+            from integrations.calendar.auth import run_calendar_auth_flow
+
+            if await run_calendar_auth_flow(
+                os.getenv("GOOGLE_CLIENT_ID", ""),
+                os.getenv("GOOGLE_CLIENT_SECRET", ""),
+                os.getenv(
+                    "GOOGLE_REDIRECT_URI", "http://127.0.0.1:8889/callback"
+                ),
+            ):
+                try:
+                    calendar_client = CalendarClient()
+                except Exception as exc2:
+                    calendar_client = None
+                    print(
+                        "Google Calendar not connected - run `python -m "
+                        "integrations.calendar.auth` to enable it."
+                    )
+                    print(f"(reason: {exc2})")
+        if calendar_client is None:
+            print(
+                "Google Calendar not connected - run `python -m "
+                "integrations.calendar.auth` to enable it."
+            )
+            print(f"(reason: {exc})")
+    if calendar_client is not None:
+        for spec in make_calendar_specs(calendar_client):
             tool_registry.register(spec)
 
     policy = PolicyEngine(
@@ -562,6 +605,8 @@ async def run():
         audio.close()
         if spotify_client is not None:
             await spotify_client.aclose()
+        if calendar_client is not None:
+            await calendar_client.aclose()
 
 
 def main():
