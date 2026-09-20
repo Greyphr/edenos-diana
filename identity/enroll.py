@@ -1,10 +1,12 @@
 """Standalone speaker enrollment.
 
-Run:  python -m identity.enroll [--name christopher]
+Run:  python -m identity.enroll [--name <your-name>]
 
 Opens its own short mic session and prompts you to say a few phrases. Each
 captured phrase is segmented with the same VAD logic used during recognition,
 embedded, and the average embedding is saved as your voiceprint profile.
+The first-ever enrollment claims ownership (see identity/enrollment_core.py);
+re-runs never change it.
 """
 
 import argparse
@@ -17,7 +19,7 @@ import numpy as np
 import sounddevice as sd
 
 from identity.embeddings import EmbeddingExtractor
-from identity.recognition import cosine_similarity
+from identity.enrollment_core import enrollment_is_coherent, save_enrollment
 from identity.vad import SAMPLE_RATE, UtteranceVAD
 from identity.voiceprint_store import VoiceprintStore
 
@@ -28,9 +30,13 @@ CAPTURE_TIMEOUT_SECONDS = 15.0
 MIN_PHRASE_SECONDS = 0.5
 
 # Minimum pairwise cosine similarity between captured phrases before an
-# enrollment is trusted. Below this, at least two phrases were almost
-# certainly not from the same speaker - ask before saving a muddled average.
+# enrollment is trusted. The threshold itself lives in
+# identity/enrollment_core.py (AGREEMENT_MIN_SIMILARITY); this mirror keeps
+# the CLI warning's wording on the same number.
 AGREEMENT_MIN_SIMILARITY = 0.6
+
+# Matches the enrollment target used by the voice-driven bootstrap.
+ENROLLMENT_PHRASE_COUNT = 5
 
 PHRASES = [
     "This is my voice, and Eden will know it.",
@@ -58,7 +64,9 @@ def minimum_pairwise_similarity(
     """Least-similar pair of collected embeddings: (similarity, i, j).
 
     Returns None when fewer than two embeddings were collected, so a single-
-    phrase enrollment has nothing to disagree with.
+    phrase enrollment has nothing to disagree with. Used only to surface the
+    offending pair in the CLI warning; enrollment_core.enrollment_is_coherent
+    is the author of the actual threshold check.
     """
     if len(embeddings) < 2:
         return None
@@ -93,7 +101,7 @@ def main() -> None:
         description="Enroll a speaker voiceprint for Eden."
     )
     parser.add_argument(
-        "--name", help="Name to save the voiceprint under (e.g. christopher)."
+        "--name", help="Name to save the voiceprint under (e.g. alex)."
     )
     parser.add_argument(
         "--phrases", nargs="+", help="Phrases to say during enrollment."
@@ -102,11 +110,14 @@ def main() -> None:
 
     name = (args.name or "").strip()
     if not name:
-        name = input(
-            "What name should this voiceprint be saved under? [christopher] "
-        ).strip()
-        if not name:
-            name = "christopher"
+        while True:
+            name = input("What's your name? ").strip()
+            if name:
+                break
+            print(
+                "  Please enter a name - this is how Eden will refer to you "
+                "after enrollment."
+            )
     phrases = args.phrases or PHRASES
 
     print("=" * 60)
@@ -161,9 +172,12 @@ def main() -> None:
     # Before averaging: if the two phrases that agree least are still far apart,
     # the capture is suspect (a different speaker, or wildly shifting mic
     # placement) and the average will be a muddled embedding that recognizes
-    # nobody. Default to NOT saving - redo the capture instead.
+    # nobody. Default to NOT saving - redo the capture instead. A "yes" here
+    # is an explicit override, passed through as ``force`` so the shared
+    # enrollment core doesn't raise a second, redundant complaint.
+    force_save = False
     worst = minimum_pairwise_similarity(embeddings)
-    if worst is not None and worst[0] < AGREEMENT_MIN_SIMILARITY:
+    if worst is not None and not enrollment_is_coherent(embeddings):
         sim, i, j = worst
         print()
         print(
@@ -177,8 +191,7 @@ def main() -> None:
         if answer not in ("y", "yes"):
             print("Enrollment cancelled - nothing was saved.")
             sys.exit(1)
-
-    combined = store.average_embeddings(embeddings)
+        force_save = True
 
     # Never silently replace an existing voiceprint: warn and require an
     # explicit yes, archiving the old profile first (same recovery path
@@ -197,10 +210,12 @@ def main() -> None:
             print(f"  Archived the previous voiceprint to:")
             print(f"    {archived}")
 
-    store.save_profile(name, combined)
+    result = save_enrollment(name, embeddings, store=store, force=force_save)
     print()
     print(f"Voiceprint for \"{name}\" saved to:")
-    print(f"  {store.profiles_dir}")
+    print(f"  {result['profiles_dir']}")
+    if result["owner_claimed"]:
+        print(f"  (First enrollment - you're the owner of this Eden.)")
     print("Done. Run `python main.py` and when you talk during an engaged")
     print("session the console will log whether your voice is recognized.")
 

@@ -32,6 +32,18 @@ class VoiceProvider(ABC):
         """Stream captured audio to the session."""
 
     @abstractmethod
+    def on_output_transcript(self, callback: Callable[[str], None]) -> None:
+        """Register the callback invoked for each finalized output transcription.
+
+        Output-side mirror of ``on_input_transcript``: the callback receives the
+        finalized text of what Eden actually said, driven by the server-side
+        ``output_audio_transcription`` config. Interim (partial-utterance)
+        fragments are never surfaced - only settled, complete transcripts reach
+        the receiver. The callback runs synchronously, so the provider must
+        dispatch it off its receive hot path (e.g. via ``asyncio.create_task``).
+        """
+
+    @abstractmethod
     def on_audio_response(self, callback: Callable[[bytes], None]) -> None:
         """Register the callback invoked for each model audio chunk."""
 

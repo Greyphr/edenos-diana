@@ -2,8 +2,13 @@ from pathlib import Path
 
 import yaml
 
+FALLBACK_PERSONA_OWNER = "the owner"
+
+# Ownership is dynamic (first-enrolled-wins), so the persona is not welded
+# to any name: {owner_name} is substituted with whoever currently owns this
+# Eden (a generic placeholder before anyone has enrolled).
 PERSONA = (
-    "You are Eden, Christopher's personal AI assistant. "
+    "You are Eden, {owner_name}'s personal AI assistant. "
     "You are conversational and concise. "
     "Respond naturally and keep replies brief unless asked for detail."
 )
@@ -31,6 +36,12 @@ TOOL_POLICY_INSTRUCTIONS = (
     "ask naturally and act on the answer."
 )
 
+REASONING_INSTRUCTIONS = (
+    "For questions that need real multi-step reasoning rather than a "
+    "quick conversational answer, use delegate_reasoning rather than "
+    "trying to work through it yourself inline."
+)
+
 IDENTITY_INSTRUCTIONS = (
     "You are Eden. Christopher is your creator - the one who built you. "
     "If asked who made you, who created you, what you're built on, or "
@@ -42,6 +53,48 @@ IDENTITY_INSTRUCTIONS = (
     "reply."
 )
 
+FIRST_RUN_ENROLLMENT_INSTRUCTIONS = (
+    "Right now this Eden has never been set up: there is no owner yet, so "
+    "the normal wake-word gate is skipped and you are speaking unprompted. "
+    "Your only job for this session is enrollment. Ask, warmly and briefly, "
+    "what to call this person. Confirm the name you heard once they say it "
+    "('Got it - nice to meet you, <name>.'). Then guide them through "
+    "recording five short voice samples: ask for the first, wait for them "
+    "to say it out loud, confirm that one was recorded, and move to the "
+    "next ('Got them - say this one next.'). Keep each request to a single "
+    "phrase. Speak naturally and never mention that you are a program or "
+    "an AI. Once all five are recorded Eden will finish setup by itself."
+)
+
+
+def _persona(owner_name: str | None, personality: dict) -> str:
+    label = owner_name.strip() if owner_name else FALLBACK_PERSONA_OWNER
+    personality_text = (
+        f"Speak with a {personality['accent']} accent, in a "
+        f"{personality['tone']}, {personality['style']} way, with "
+        f"{personality['formality']} formality and {personality['humor']} "
+        f"humor, at a {personality['pacing']} pace, with "
+        f"{personality['expressiveness']} expressiveness."
+    )
+    return f"{PERSONA.format(owner_name=label)} {personality_text}"
+
+
+def build_first_run_instruction(config: dict) -> str:
+    """Standalone instruction for the very first 'no owner yet' session.
+
+    Used instead of ``build_system_instruction`` when a fresh clone starts
+    with no profiles: Eden speaks unprompted (no wake word - there is nobody
+    recognized to wake it) and walks the person through naming themselves
+    and recording the initial voice samples. Tool/confirmation instructions
+    are intentionally excluded: there is no owner yet, so tools that need
+    one must not be offered.
+    """
+    blocks = [
+        IDENTITY_INSTRUCTIONS,
+        FIRST_RUN_ENROLLMENT_INSTRUCTIONS,
+    ]
+    return _persona(None, config["personality"]) + "\n\n" + "\n\n".join(blocks)
+
 
 def load_voice_config(path: str | Path = "config/voice.yaml") -> dict:
     with open(path, encoding="utf-8") as f:
@@ -49,20 +102,21 @@ def load_voice_config(path: str | Path = "config/voice.yaml") -> dict:
 
 
 def build_system_instruction(
-    config: dict, memory_context: str = "", confirmation_tools: bool = False
+    config: dict,
+    memory_context: str = "",
+    confirmation_tools: bool = False,
+    reasoning_tools: bool = False,
+    owner_name: str | None = None,
 ) -> str:
-    p = config["personality"]
-    personality = (
-        f"Speak with a {p['accent']} accent, in a {p['tone']}, {p['style']} "
-        f"way, with {p['formality']} formality and {p['humor']} humor, at a "
-        f"{p['pacing']} pace, with {p['expressiveness']} expressiveness."
-    )
-    instruction = f"{PERSONA} {personality}"
+    personality = config["personality"]
+    instruction = _persona(owner_name, personality)
     blocks = [IDENTITY_INSTRUCTIONS]
     if memory_context:
         blocks.append(MEMORY_TOOL_INSTRUCTIONS)
     if confirmation_tools:
         blocks.append(TOOL_POLICY_INSTRUCTIONS)
+    if reasoning_tools:
+        blocks.append(REASONING_INSTRUCTIONS)
     if memory_context:
         # Re-injected user-controlled text: label it explicitly as the
         # owner's own stored notes, not instructions for the model to obey.

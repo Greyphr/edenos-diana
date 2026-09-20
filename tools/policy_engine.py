@@ -75,24 +75,39 @@ class PolicyEngine:
     """Gate every tool call through actor role + risk tier, and funnel
     WRITE/SENSITIVE actions through a single pending-confirmation flow.
 
-    ``get_recognized`` is a ``Callable[[], bool]`` supplied by main.py,
-    backed by the most recent speaker recognition result. ``get_freshly_recognized``
-    is the same signal with a much shorter window: confirming a pending action
-    requires evidence from right now, not stale trust from earlier in the session.
+    ``get_recognized_name`` is a ``Callable[[], str | None]`` supplied by
+    main.py, returning the currently recognized speaker name (None when nobody
+    is recognized). ``get_owner_name`` is a ``Callable[[], str | None]``
+    returning the current owner marker's name. ``get_freshly_recognized_name``
+    is the recognition signal with a much shorter window: confirming a pending
+    action requires fresh evidence from right now, not stale trust from
+    earlier in the session. Ownership is dynamic — the getters are consulted
+    per call, so a first-run enrollment that claims the owner name takes
+    effect immediately.
     """
 
     def __init__(
         self,
         registry: ToolRegistry,
-        get_recognized: Callable[[], bool],
-        get_freshly_recognized: Callable[[], bool],
+        get_recognized_name: Callable[[], str | None],
+        get_owner_name: Callable[[], str | None],
+        get_freshly_recognized_name: Callable[[], bool] | None = None,
         wait_for_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._registry = registry
-        self._get_recognized = get_recognized
-        self._get_freshly_recognized = get_freshly_recognized
+        self._get_recognized_name = get_recognized_name
+        self._get_owner_name = get_owner_name
+        self._get_freshly_recognized_name = get_freshly_recognized_name
         self._wait_for_pending = wait_for_pending
         self._pending: dict | None = None
+
+    def _freshly_recognized(self) -> bool:
+        """Fresh-recognition gate for confirmation: True when a recognition
+        landed within the short confirmation window. None getter stays
+        permissive (callers that don't supply one accept any timing)."""
+        if self._get_freshly_recognized_name is None:
+            return True
+        return self._get_freshly_recognized_name()
 
     async def _dispatch(self, spec: ToolSpec, args: dict) -> dict:
         """Run the handler directly (READ/TRIVIAL) or stage a confirmation
@@ -111,7 +126,9 @@ class PolicyEngine:
         """Return the function registered with the voice provider for spec.name."""
 
         async def handler(**args) -> dict:
-            role = role_for_actor(self._get_recognized())
+            role = role_for_actor(
+                self._get_recognized_name(), self._get_owner_name()
+            )
             if not has_permission(role, spec.risk_tier):
                 if (
                     spec.risk_tier != RiskTier.READ
@@ -124,7 +141,9 @@ class PolicyEngine:
                     # wait, not a retry loop: bounded latency, not
                     # unbounded patience.
                     await self._wait_for_pending()
-                    role = role_for_actor(self._get_recognized())
+                    role = role_for_actor(
+                        self._get_recognized_name(), self._get_owner_name()
+                    )
                     if has_permission(role, spec.risk_tier):
                         return await self._dispatch(spec, args)
                 logger.info(
@@ -227,13 +246,17 @@ class PolicyEngine:
         # session isn't good enough to approve a write. Either way, give an
         # in-flight recognition for the confirmation utterance one bounded
         # wait before finalizing a denial (one wait, not a retry loop).
-        role = role_for_actor(self._get_recognized())
-        fresh = self._get_freshly_recognized()
+        role = role_for_actor(
+            self._get_recognized_name(), self._get_owner_name()
+        )
+        fresh = self._freshly_recognized()
         if not has_permission(role, pending["risk_tier"]) or not fresh:
             if self._wait_for_pending is not None:
                 await self._wait_for_pending()
-            role = role_for_actor(self._get_recognized())
-            fresh = self._get_freshly_recognized()
+            role = role_for_actor(
+                self._get_recognized_name(), self._get_owner_name()
+            )
+            fresh = self._freshly_recognized()
 
         if not has_permission(role, pending["risk_tier"]):
             self._pending = None

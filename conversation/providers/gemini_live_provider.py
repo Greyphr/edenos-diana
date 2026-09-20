@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Fallback Live/native-audio model when config/voice.yaml omits "model".
 # The live model name is overridable per-config (no code change needed).
-DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
+DEFAULT_MODEL = "gemini-3.8-live"
 
 # Initial-connection smoothing: a transient blip at startup shouldn't fail the
 # whole boot, so retry a few times with a short fixed delay before giving up.
@@ -49,6 +49,7 @@ class GeminiLiveProvider(VoiceProvider):
         self._session_ctx = None
         self._audio_callback: Callable[[bytes], None] | None = None
         self._input_transcript_callback: Callable[[str], None] | None = None
+        self._output_transcript_callback: Callable[[str], None] | None = None
         self._interrupted_callback: Callable[[], None] | None = None
         self._disconnected_callback: Callable[[], None] | None = None
         # Called with a bool after a mid-session reconnect: True when the
@@ -145,6 +146,7 @@ class GeminiLiveProvider(VoiceProvider):
             # call. Only the finalized transcript is surfaced; interim
             # (partial-utterance) fragments are dropped in _handle_response.
             "input_audio_transcription": types.AudioTranscriptionConfig(),
+            "output_audio_transcription": types.AudioTranscriptionConfig(),
             "speech_config": types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -269,6 +271,16 @@ class GeminiLiveProvider(VoiceProvider):
                 asyncio.create_task(self._dispatch_input_transcript(text))
             return
 
+        if (
+            response.server_content
+            and response.server_content.output_transcription
+            and response.server_content.output_transcription.finished
+            and self._output_transcript_callback
+        ):
+            text = response.server_content.output_transcription.text
+            asyncio.create_task(self._dispatch_output_transcript(text))
+            return
+
         if response.server_content and response.server_content.model_turn:
             for part in response.server_content.model_turn.parts:
                 if part.inline_data and isinstance(part.inline_data.data, bytes):
@@ -306,6 +318,24 @@ class GeminiLiveProvider(VoiceProvider):
             # Policy decisions are advisory to the voice loop; a failing
             # check must never take down the session with it.
             logger.warning("input transcript callback failed: %r", e)
+
+    async def _dispatch_output_transcript(self, text: str) -> None:
+        """Run a finalized *output* transcript through the registered callback.
+
+        Direct mirror of ``_dispatch_input_transcript``: dispatched off the
+        receive hot path (the caller wraps it in ``asyncio.create_task``) so a
+        slow policy/labelling consumer can never stall audio, interruption, or
+        reconnection handling. Only settled transcripts arrive here (the receive
+        branch gates on ``finished``), matching the callback contract exactly.
+        """
+        if not self._output_transcript_callback:
+            return
+        try:
+            self._output_transcript_callback(text)
+        except Exception as exc:
+            # A transcript consumer is advisory to Eden; a failing callback
+            # must never take the live session down with it.
+            logger.warning("output transcript callback failed: %r", exc)
 
     async def _handle_disconnect(
         self, error: Exception | None, notify_disconnect: bool = True
@@ -436,6 +466,9 @@ class GeminiLiveProvider(VoiceProvider):
 
     def on_input_transcript(self, callback: Callable[[str], None]) -> None:
         self._input_transcript_callback = callback
+
+    def on_output_transcript(self, callback: Callable[[str], None]) -> None:
+        self._output_transcript_callback = callback
 
     def on_disconnected(self, callback: Callable[[], None]) -> None:
         self._disconnected_callback = callback

@@ -112,17 +112,27 @@ def run_startup_checks() -> list[tuple[str, bool, str, str]]:
             )
         )
 
-    # Enrolled voiceprint (warning only) ----------------------------------
+    # Enrolled voiceprint / ownership (warning only) ----------------------
     try:
         from identity.voiceprint_store import VoiceprintStore
 
-        profiles = VoiceprintStore().list_profiles()
+        store = VoiceprintStore()
+        profiles = store.list_profiles()
+        owner = store.get_owner_name()
         if profiles:
+            detail = f"{len(profiles)} profile(s): {', '.join(profiles)}"
+            if owner:
+                detail += f" (owner: {owner})"
+            else:
+                detail += (
+                    " (no owner marker - owner-tier tools denied until "
+                    "re-enrollment claims one)"
+                )
             checks.append(
                 (
                     "enrolled voiceprint",
                     True,
-                    f"{len(profiles)} profile(s): {', '.join(profiles)}",
+                    detail,
                     SEVERITY_WARNING,
                 )
             )
@@ -131,8 +141,8 @@ def run_startup_checks() -> list[tuple[str, bool, str, str]]:
                 (
                     "enrolled voiceprint",
                     False,
-                    "none - run 'python -m identity.enroll' to add one "
-                    "(warning only; Eden runs without it)",
+                    "none - first run will bootstrap enrollment over voice "
+                    "(or run 'python -m identity.enroll' manually)",
                     SEVERITY_WARNING,
                 )
             )

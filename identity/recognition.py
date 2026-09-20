@@ -40,6 +40,13 @@ class SpeakerRecognizer:
       duration_s: float | None)`` fired whenever a scored utterance ends.
       Utterances shorter than ``SCORING_MIN_MS`` are not scored and fire
       nothing.
+    - ``collect_enrollment(target, on_sample, on_complete)`` switches the
+      recognizer into enrollment mode: instead of matching completed
+      utterances against stored profiles, it extracts an embedding from each
+      one and fires ``on_sample(count, target)``. After ``target`` samples
+      are gathered, ``on_complete(embeddings)`` fires, the recognizer
+      silently drops back to normal scoring, and the same VAD + extraction
+      pipeline as ongoing recognition is reused (no second mic session).
     """
 
     def __init__(
@@ -55,6 +62,29 @@ class SpeakerRecognizer:
         # current utterance's result instead of judging on nothing yet, and
         # so the tasks aren't dropped (asyncio.create_task result held here).
         self._pending_tasks: set[asyncio.Task] = set()
+        # Enrollment-collection state (None when in normal scoring mode).
+        self._enroll_target: int | None = None
+        self._enroll_collector_callback = None
+        self._enroll_complete_callback = None
+        self._enroll_embeddings: list[np.ndarray] = []
+
+    def collect_enrollment(
+        self, target: int, on_sample, on_complete, *, start_fresh: bool = True
+    ) -> None:
+        """Start collecting ``target`` phrase embeddings for enrollment.
+
+        ``on_sample(count, target)`` fires per completed utterance (on the
+        scoring thread/loop), ``on_complete(embeddings)`` fires once ``target``
+        samples are gathered, after which scoring resumes normally.
+        """
+        if start_fresh:
+            self._enroll_embeddings = []
+        self._enroll_target = target
+        self._enroll_collector_callback = on_sample
+        self._enroll_complete_callback = on_complete
+
+    def _enroll_mode(self) -> bool:
+        return self._enroll_target is not None
 
     def on_result(self, callback) -> None:
         self._callbacks.append(callback)
@@ -129,6 +159,8 @@ class SpeakerRecognizer:
                 dur_ms, SCORING_MIN_MS,
             )
             return None
+        if self._enroll_mode():
+            return self._enroll_sync(audio, dur_ms)
         profiles = self._store.load_all()
         if not profiles:
             # Default-deny: no profile enrolled yet, always unrecognized.
@@ -145,6 +177,37 @@ class SpeakerRecognizer:
         if best_similarity >= CONFIDENCE_RECOGNIZED:
             return best_name, best_similarity, True, dur_ms
         return None, best_similarity, False, dur_ms
+
+    def _enroll_sync(self, audio: bytes, dur_ms: int):
+        """Enrollment mode: extract one embedding per utterance and collect.
+
+        Runs on the same thread-shape as scoring (off the audio hot path),
+        reusing the exact VAD + EmbeddingExtractor pipeline as recognition.
+        On the target count the recognizer drops back to normal scoring
+        silently before firing the completion callback.
+        """
+        embedding = self._extractor.extract(audio)
+        self._enroll_embeddings.append(embedding)
+        count = len(self._enroll_embeddings)
+        collector = self._enroll_collector_callback
+        if collector is not None:
+            try:
+                collector(check_count=count, target=self._enroll_target)
+            except Exception:
+                logger.exception("enrollment sample callback raised")
+        if count >= self._enroll_target:
+            self._enroll_target = None
+            completed = self._enroll_embeddings
+            self._enroll_embeddings = []
+            complete = self._enroll_complete_callback
+            self._enroll_complete_callback = None
+            self._enroll_collector_callback = None
+            if complete is not None:
+                try:
+                    complete(completed)
+                except Exception:
+                    logger.exception("enrollment completion callback raised")
+        return None
 
     def _emit(self, name, confidence, recognized, duration_ms=None) -> None:
         duration_s = duration_ms / 1000.0 if duration_ms is not None else None
