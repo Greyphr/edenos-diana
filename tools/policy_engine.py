@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 
@@ -10,7 +11,22 @@ logger = logging.getLogger(__name__)
 PENDING_TIMEOUT_SECONDS = 45
 
 # Fixed set of affirmative responses accepted for WRITE-tier confirmation.
+# Matched on word boundaries within the (normalized) response, so "yes, please"
+# and "yes." both count while "yesterday" doesn't.
 _AFFIRMATIVES = frozenset({"yes", "yeah", "confirm", "do it", "go ahead"})
+
+# Explicit-negative word set for WRITE-tier (and SENSITIVE) confirmation,
+# checked BEFORE the affirmative set: only a recognized no can cancel a pending
+# action. A response that is neither a recognized no nor a recognized yes
+# stays pending for another attempt.
+_NEGATIVES = frozenset({"no", "don't", "do not", "cancel", "stop", "nope", "wait"})
+
+# Clarifying-question markers: a response that asks for detail ("wait, which
+# one?") is ambiguous, not a denial — even when it leads with a negative word
+# like "wait".
+_QUESTION_WORDS = frozenset(
+    {"which", "what", "when", "where", "why", "how", "who"}
+)
 
 # Lightweight basic-type checks for declared parameter types. This is not a
 # full JSON Schema validator - just enough to catch a model that omits a
@@ -22,6 +38,36 @@ _BASIC_TYPE_CHECKS: dict[str, Callable[[object], bool]] = {
     "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
     "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
 }
+
+
+def _normalize_response(text: str | None) -> str:
+    """Normalize a confirmation response once, near the top of resolution:
+    casefold, strip surrounding whitespace, and strip trailing sentence
+    punctuation (".!?"). Keeps "yes.", "YES  ", "please." comparable to the
+    affirmative/phrase sets while exact SENSITIVE phrase matching stays exact
+    against the normalized form."""
+    text = (text or "").casefold().strip()
+    return text.strip(" .!?").strip()
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    """Word-boundary containment: ``no`` matches inside "no, don't confirm"
+    but not inside "nope" or "notebook"; ``do it`` matches "let's do it"."""
+    return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
+def _matches_any(text: str, phrases: frozenset[str]) -> bool:
+    return any(_contains_phrase(text, phrase) for phrase in phrases)
+
+
+def _looks_like_question(text: str) -> bool:
+    """Ambiguity test: a trailing question mark or a wh-word ("which", "what",
+    ...) means the owner asked for clarification rather than deciding. Such a
+    reply must leave the action pending, never cancel it."""
+    if "?" in text:
+        return True
+    words = re.findall(r"[a-z0-9']+", text)
+    return any(word in _QUESTION_WORDS for word in words)
 
 
 def _check_args(spec: ToolSpec, args: dict) -> None:
@@ -78,12 +124,13 @@ class PolicyEngine:
     ``get_recognized_name`` is a ``Callable[[], str | None]`` supplied by
     main.py, returning the currently recognized speaker name (None when nobody
     is recognized). ``get_owner_name`` is a ``Callable[[], str | None]``
-    returning the current owner marker's name. ``get_freshly_recognized_name``
-    is the recognition signal with a much shorter window: confirming a pending
-    action requires fresh evidence from right now, not stale trust from
-    earlier in the session. Ownership is dynamic — the getters are consulted
-    per call, so a first-run enrollment that claims the owner name takes
-    effect immediately.
+    returning the current owner marker's name. ``get_last_strong_recognition_time``
+    returns the raw (monotonic) timestamp of the most recent strong
+    recognition; confirming a pending action requires genuinely NEW evidence —
+    a strong recognition that landed AFTER the action was created — not just
+    recent trust from earlier in the session. Ownership is dynamic — the
+    getters are consulted per call, so a first-run enrollment that claims the
+    owner name takes effect immediately.
     """
 
     def __init__(
@@ -91,23 +138,29 @@ class PolicyEngine:
         registry: ToolRegistry,
         get_recognized_name: Callable[[], str | None],
         get_owner_name: Callable[[], str | None],
-        get_freshly_recognized_name: Callable[[], bool] | None = None,
+        get_last_strong_recognition_time: Callable[[], float | None] | None = None,
         wait_for_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._registry = registry
         self._get_recognized_name = get_recognized_name
         self._get_owner_name = get_owner_name
-        self._get_freshly_recognized_name = get_freshly_recognized_name
+        self._get_last_strong_recognition_time = get_last_strong_recognition_time
         self._wait_for_pending = wait_for_pending
         self._pending: dict | None = None
 
-    def _freshly_recognized(self) -> bool:
-        """Fresh-recognition gate for confirmation: True when a recognition
-        landed within the short confirmation window. None getter stays
-        permissive (callers that don't supply one accept any timing)."""
-        if self._get_freshly_recognized_name is None:
+    def _fresh_ok(self, pending: dict) -> bool:
+        """Genuinely-NEW-evidence gate for confirmation: True only when a
+        strong recognition landed strictly AFTER the pending action was
+        created. The owner's original request that triggered the proposal does
+        not count — recent-but-older-than-the-proposal trust doesn't approve a
+        write. ``pending["created_at"]`` already uses ``time.monotonic()`` and
+        so does main.py's RecognitionTrust, making the comparison valid. None
+        getter stays permissive (callers that don't supply one accept any
+        timing)."""
+        if self._get_last_strong_recognition_time is None:
             return True
-        return self._get_freshly_recognized_name()
+        last = self._get_last_strong_recognition_time()
+        return last is not None and last > pending["created_at"]
 
     async def _dispatch(self, spec: ToolSpec, args: dict) -> dict:
         """Run the handler directly (READ/TRIVIAL) or stage a confirmation
@@ -170,7 +223,10 @@ class PolicyEngine:
                 "pending_tool": self._pending["tool_name"],
             }
         if spec.risk_tier == RiskTier.SENSITIVE:
-            phrase = spec.confirmation_phrase or "confirm"
+            # Registration guarantees a SENSITIVE tool declares an explicit
+            # confirmation_phrase (ToolRegistry.register raises otherwise), so
+            # there is no weak default to fall back on here.
+            phrase = spec.confirmation_phrase
             self._pending = {
                 "tool_name": spec.name,
                 "args": args,
@@ -221,12 +277,13 @@ class PolicyEngine:
 
         The permissions being re-checked are identical whichever path got us
         here: whoever confirms — spoken or via tool call — must still be an
-        authorized actor *right now* and back it with a genuinely fresh
-        recognitionate confirmation window.
+        authorized actor *right now* and back it with genuinely new evidence —
+        a strong recognition that landed AFTER the action was proposed.
         """
         if self._pending is None:
             return None
-        response_text = (response_text or "").strip().lower()
+
+        response_text = _normalize_response(response_text)
         pending = self._pending
         if time.monotonic() - pending["created_at"] > PENDING_TIMEOUT_SECONDS:
             self._pending = None
@@ -238,28 +295,36 @@ class PolicyEngine:
                 "tool_name": pending["tool_name"],
             }
 
+        # Atomic claim of the pending slot, before any await. Two concurrent
+        # resolution attempts (confirm_action and check_transcript racing is
+        # the designed behavior) could otherwise both pass the initial check,
+        # suspend on the wait below, and both execute the handler. Whoever
+        # claims first clears the slot; the loser sees None above and sits
+        # out. The expiry check stays above this line so an expired action is
+        # still reported "cancelled" rather than silently claimed.
+        pending, self._pending = self._pending, None
+
         # Re-check the actor's permission now, not just when the action was
         # first proposed: the person confirming must still be authorized.
         # Someone who merely overheard the phrase shouldn't complete it.
         # Confirmation additionally demands a recognition that is genuinely
-        # FRESH (get_freshly_recognized) - stale trust from earlier in the
-        # session isn't good enough to approve a write. Either way, give an
-        # in-flight recognition for the confirmation utterance one bounded
-        # wait before finalizing a denial (one wait, not a retry loop).
+        # NEW (a strong recognition AFTER the action was created, not stale
+        # trust from earlier in the session). Either way, give an in-flight
+        # recognition for the confirmation utterance one bounded wait before
+        # finalizing a denial (one wait, not a retry loop).
         role = role_for_actor(
             self._get_recognized_name(), self._get_owner_name()
         )
-        fresh = self._freshly_recognized()
+        fresh = self._fresh_ok(pending)
         if not has_permission(role, pending["risk_tier"]) or not fresh:
             if self._wait_for_pending is not None:
                 await self._wait_for_pending()
             role = role_for_actor(
                 self._get_recognized_name(), self._get_owner_name()
             )
-            fresh = self._freshly_recognized()
+            fresh = self._fresh_ok(pending)
 
         if not has_permission(role, pending["risk_tier"]):
-            self._pending = None
             logger.info(
                 "Pending action %r denied for role %r (tier=%s) at confirmation",
                 pending["tool_name"], role, pending["risk_tier"].value,
@@ -270,8 +335,9 @@ class PolicyEngine:
             }
 
         if not fresh:
-            # Keep the pending action in place so a fresh confirmation
-            # attempt can still complete it once a new recognition lands.
+            # Not permanently denied: a genuinely new recognition can still
+            # complete it later, so hand the claimed slot back (F-03).
+            self._pending = pending
             logger.info(
                 "Pending action %r denied: confirmation requires a fresh recognition",
                 pending["tool_name"],
@@ -282,13 +348,25 @@ class PolicyEngine:
                 "reason": "confirmation requires a fresh recognition",
             }
 
-        if pending["risk_tier"] == RiskTier.SENSITIVE:
-            affirmed = pending["required_confirmation"].lower() in response_text
-        else:
-            affirmed = response_text in _AFFIRMATIVES
+        # Affirmation classification (F-04). A clarifying question is
+        # ambiguous, never a denial — even when it leads with a negative word
+        # like "wait". Explicit negatives cancel; WRITE affirmatives match on
+        # word boundaries; SENSITIVE requires the exact (normalized) phrase.
+        # Anything else leaves the action pending so the owner can try again
+        # before the timeout.
+        if _looks_like_question(response_text):
+            self._pending = pending
+            logger.info(
+                "Pending action %r kept pending for ambiguous response %r",
+                pending["tool_name"], response_text,
+            )
+            return {
+                "status": "pending",
+                "tool_name": pending["tool_name"],
+                "reason": "response not understood as yes or no",
+            }
 
-        self._pending = None
-        if not affirmed:
+        if _matches_any(response_text, _NEGATIVES):
             logger.info(
                 "Pending action %r denied by owner response %r",
                 pending["tool_name"], response_text,
@@ -296,6 +374,26 @@ class PolicyEngine:
             return {
                 "status": "cancelled",
                 "tool_name": pending["tool_name"],
+            }
+
+        if pending["risk_tier"] == RiskTier.SENSITIVE:
+            affirmed = response_text == _normalize_response(
+                pending["required_confirmation"]
+            )
+        else:
+            affirmed = _matches_any(response_text, _AFFIRMATIVES)
+
+        if not affirmed:
+            # Ambiguous: neither an explicit no nor a recognized yes/phrase.
+            self._pending = pending
+            logger.info(
+                "Pending action %r kept pending for unrecognized response %r",
+                pending["tool_name"], response_text,
+            )
+            return {
+                "status": "pending",
+                "tool_name": pending["tool_name"],
+                "reason": "response not understood as yes or no",
             }
 
         spec = self._registry.get(pending["tool_name"])

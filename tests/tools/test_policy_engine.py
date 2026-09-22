@@ -2,17 +2,17 @@
 
 Covers: immediate READ execution, WRITE/SENSITIVE staging + confirmation,
 SENSITIVE exact-phrase semantics (a bare "yes" is not enough), expiry via
-monotonic-clock injection, the identity-freshness gap (fresh recognition
-dropping between propose and confirm denies the action), the single-pending
-slot (a second proposal is rejected, never replacing the first), and the two
-parallel resolution channels (check_transcript and confirm_action share the
-same queue and whichever resolves first leaves the other idle).
+monotonic-clock injection, the identity-freshness gap (a strong recognition
+that is NOT newer than the proposal denies the action — F-01), the
+single-pending slot, the confirmation race (two parallel resolution channels
+claim the slot exactly once — F-03), and F-04 word-boundary/no/ambiguous
+response classification against both WRITE and SENSITIVE tiers.
 """
 
-import time
 from unittest import mock
 
 import pytest
+import asyncio
 
 from tools.policy_engine import PENDING_TIMEOUT_SECONDS, PolicyEngine
 from tools.registry import RiskTier, ToolRegistry, ToolSpec
@@ -20,10 +20,16 @@ from tools.roles import ROLE_OWNER, ROLE_UNKNOWN
 
 
 class _Actors:
-    def __init__(self, recognized="alex", owner="alex", fresh=True) -> None:
+    """Simulates main.py's RecognitionTrust for the policy engine: the last
+    strong recognition's monotonic timestamp (inf by default so ordinary tests
+    are always fresh) plus the recognized/owner names."""
+
+    def __init__(
+        self, recognized="alex", owner="alex", last_strong: float | None = float("inf")
+    ) -> None:
         self.recognized = recognized
         self.owner = owner
-        self.fresh = fresh
+        self.last_strong = last_strong
 
     def recognized_name(self) -> str | None:
         return self.recognized
@@ -31,8 +37,11 @@ class _Actors:
     def owner_name(self) -> str | None:
         return self.owner
 
-    def fresh_state(self) -> bool:
-        return self.fresh
+    def last_strong_recognition_time(self) -> float | None:
+        return self.last_strong
+
+    def record_strong(self, when: float) -> None:
+        self.last_strong = when
 
 
 _BASE_PARAMS = {
@@ -74,7 +83,7 @@ def toolbox():
         registry,
         actors.recognized_name,
         actors.owner_name,
-        actors.fresh_state,
+        actors.last_strong_recognition_time,
     )
     return registry, engine, actors, calls
 
@@ -131,18 +140,26 @@ async def test_second_proposal_while_pending_is_rejected(toolbox):
 
 # --- SENSITIVE needs the exact phrase -------------------------------------
 
-async def test_sensitive_bare_yes_is_not_accepted(toolbox):
+async def test_sensitive_bare_yes_leaves_pending(toolbox):
     await _wrap(toolbox, "delete_vault")(x="erase")
     _registry, engine, _actors, calls = toolbox
     outcome = await engine.confirm_action(response="yes")
-    assert outcome["status"] == "cancelled"
+    # "yes" is neither the exact phrase nor an explicit no: ambiguous, left
+    # pending so the owner can say the real phrase (which then completes it).
+    assert outcome["status"] == "pending"
+    assert "not understood" in outcome.get("reason", "")
     assert calls == []
+
+    confirmed = await engine.confirm_action(response="erase everything")
+    assert confirmed["status"] == "ok"
+    assert calls == ["delete_vault"]
 
 
 async def test_sensitive_exact_phrase_confirms(toolbox):
     await _wrap(toolbox, "delete_vault")(x="erase")
     _registry, engine, _actors, calls = toolbox
-    outcome = await engine.confirm_action(response="yes erase everything now")
+    # Exact equality after normalization: trailing punctuation is stripped.
+    outcome = await engine.confirm_action(response="erase everything.")
     assert outcome["status"] == "ok"
     assert calls == ["delete_vault"]
 
@@ -166,25 +183,52 @@ async def test_pending_expires_after_timeout(toolbox):
     assert await engine.confirm_action(response="yes") == {"error": "nothing pending"}
 
 
-# --- Identity-freshness gap ------------------------------------------------
+# --- Genuinely-NEW evidence (F-01) -----------------------------------------
+
+async def test_recognition_no_newer_than_proposal_is_denied(toolbox):
+    """F-01: the owner's ORIGINAL request that triggered the proposal is not
+    new evidence. Immediately confirming with no recognition in between must
+    be denied, and only a genuinely later strong recognition completes it."""
+    _registry, engine, actors, calls = toolbox
+    fake_time = mock.Mock()
+    fake_time.monotonic.return_value = 0.0  # proposal created_at = 0.0
+    with mock.patch("tools.policy_engine.time", fake_time):
+        await _wrap(toolbox, "write_note")(x="immediate")
+        actors.record_strong(0.0)  # last strong == proposal time, not after
+        denied = await engine.confirm_action(response="yes")
+
+        assert denied["error"] == "not permitted"
+        assert "fresh recognition" in denied.get("reason", "")
+        assert calls == []
+
+        # A genuine new affirmative utterance lands AFTER the proposal.
+        actors.record_strong(1.0)
+        confirmed = await engine.confirm_action(response="yes.")
+
+    assert confirmed["name"] == "write_note"
+    assert confirmed["tool_name"] == "write_note"
+    assert calls == ["write_note"]
+
 
 async def test_stale_recognition_between_propose_and_confirm_denies(toolbox):
     actors = toolbox[2]
-    await _wrap(toolbox, "write_note")(x="freshness")
-    actors.fresh = False  # recognition lands, then the window lapses
+    fake_time = mock.Mock()
+    fake_time.monotonic.return_value = 0.0
+    with mock.patch("tools.policy_engine.time", fake_time):
+        await _wrap(toolbox, "write_note")(x="freshness")  # created_at = 0.0
+        actors.record_strong(0.0)  # nothing new landed since the proposal
+        _registry, engine, _actors, calls = toolbox
+        outcome = await engine.confirm_action(response="yes")
+        assert outcome["error"] == "not permitted"
+        assert "fresh recognition" in outcome.get("reason", "")
+        assert calls == []
 
-    _registry, engine, _actors, calls = toolbox
-    outcome = await engine.confirm_action(response="yes")
-    assert outcome["error"] == "not permitted"
-    assert "fresh recognition" in outcome.get("reason", "")
-    assert calls == []
-
-    # The pending action is kept, so a genuinely fresh recognition still
-    # clears it.
-    actors.fresh = True
-    confirmed = await engine.confirm_action(response="yes")
-    assert confirmed["name"] == "write_note"
-    assert calls == ["write_note"]
+        # The pending action was restored (not cleared) by the denial, so a
+        # genuinely new recognition still clears it.
+        actors.record_strong(1.0)
+        confirmed = await engine.confirm_action(response="yes")
+        assert confirmed["name"] == "write_note"
+        assert calls == ["write_note"]
 
 
 async def test_wrong_role_at_confirmation_is_denied(toolbox):
@@ -236,6 +280,127 @@ async def test_confirm_action_resolving_first_leaves_transcript_idle(toolbox):
 async def test_check_transcript_without_pending_returns_none(toolbox):
     _registry, engine, _actors, _calls = toolbox
     assert await engine.check_transcript(transcript="yes") is None
+
+
+# --- Confirmation race (F-03) ----------------------------------------------
+
+async def test_concurrent_resolutions_execute_handler_exactly_once(toolbox):
+    """confirm_action and check_transcript racing (the designed behavior)
+    must claim the pending slot exactly once. A slow wait_for_pending forces
+    the first attempt to suspend mid-resolution; the second must find the
+    slot already claimed and sit out — the handler runs once, never twice."""
+    registry, _engine, actors, calls = toolbox
+
+    async def _slow_wait() -> None:
+        await asyncio.sleep(0.05)
+
+    engine = PolicyEngine(
+        registry,
+        actors.recognized_name,
+        actors.owner_name,
+        actors.last_strong_recognition_time,
+        wait_for_pending=_slow_wait,
+    )
+
+    fake_time = mock.Mock()
+    fake_time.monotonic.return_value = 0.0  # proposal created_at = 0.0
+    with mock.patch("tools.policy_engine.time", fake_time):
+        await engine.wrap_handler(registry.get("write_note"))(x="race")
+
+        # The confirmation utterance is still scoring: nobody recognized and
+        # no new strong recognition yet — so the first resolution attempt
+        # hits the wait. The recognition lands mid-wait.
+        actors.recognized = None
+        actors.record_strong(0.0)
+
+        async def _land_recognition() -> None:
+            await asyncio.sleep(0.02)
+            actors.recognized = "alex"
+            actors.record_strong(1.0)  # genuinely new, > created_at
+
+        _, transcript_out, _ = await asyncio.gather(
+            engine.confirm_action(response="yes"),
+            engine.check_transcript(transcript="yes"),
+            _land_recognition(),
+        )
+
+    assert calls == ["write_note"]  # exactly once
+    assert transcript_out is None  # the transcript side found nothing pending
+
+
+# --- F-04 classification, WRITE tier ---------------------------------------
+
+async def test_write_yes_with_punctuation_confirms(toolbox):
+    await _wrap(toolbox, "write_note")(x="punct")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="yes.")
+    assert outcome["name"] == "write_note"
+    assert calls == ["write_note"]
+
+
+async def test_write_yes_please_confirms(toolbox):
+    await _wrap(toolbox, "write_note")(x="polite")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="yes please")
+    assert outcome["name"] == "write_note"
+    assert calls == ["write_note"]
+
+
+async def test_write_explicit_negative_cancels(toolbox):
+    await _wrap(toolbox, "write_note")(x="neg")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="no, don't confirm")
+    assert outcome["status"] == "cancelled"
+    assert calls == []
+    # The slot was cancelled outright: a later yes finds nothing pending.
+    assert await engine.confirm_action(response="yes") == {"error": "nothing pending"}
+
+
+async def test_write_ambiguous_question_leaves_pending(toolbox):
+    await _wrap(toolbox, "write_note")(x="ambig")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="wait, which one")
+    assert outcome["status"] == "pending"
+    assert "not understood" in outcome.get("reason", "")
+    assert calls == []
+    # Ambiguous does not cancel: a real yes afterwards completes it.
+    confirmed = await engine.confirm_action(response="yes")
+    assert confirmed["name"] == "write_note"
+    assert calls == ["write_note"]
+
+
+# --- F-04 classification, SENSITIVE tier -----------------------------------
+
+async def test_sensitive_yes_please_leaves_pending(toolbox):
+    await _wrap(toolbox, "delete_vault")(x="polite")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="yes please")
+    # A polite yes is not the exact phrase — ambiguous, left pending.
+    assert outcome["status"] == "pending"
+    assert calls == []
+
+
+async def test_sensitive_explicit_negative_cancels(toolbox):
+    await _wrap(toolbox, "delete_vault")(x="neg")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="no, don't confirm")
+    assert outcome["status"] == "cancelled"
+    assert calls == []
+    assert await engine.confirm_action(response="erase everything") == {
+        "error": "nothing pending"
+    }
+
+
+async def test_sensitive_ambiguous_question_leaves_pending(toolbox):
+    await _wrap(toolbox, "delete_vault")(x="ambig")
+    _registry, engine, _actors, calls = toolbox
+    outcome = await engine.confirm_action(response="wait, which one")
+    assert outcome["status"] == "pending"
+    assert calls == []
+    # Still pending: the exact phrase resolves it afterwards.
+    confirmed = await engine.confirm_action(response="erase everything")
+    assert confirmed["status"] == "ok"
+    assert calls == ["delete_vault"]
 
 
 # --- Argument validation ---------------------------------------------------

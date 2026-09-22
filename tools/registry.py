@@ -39,6 +39,16 @@ class ToolRegistry:
         self._tools: dict[str, ToolSpec] = {}
 
     def register(self, spec: ToolSpec) -> None:
+        if spec.risk_tier is RiskTier.SENSITIVE and not spec.confirmation_phrase:
+            # A SENSITIVE tool with no real phrase is a design mistake, not a
+            # runtime case to handle gracefully: without it the confirmation
+            # would fall back on a single weak word, and F-04's exact-phrase
+            # matching makes that unworkable. Reject it here so it fails at
+            # registration, not mid-session.
+            raise ValueError(
+                f"SENSITIVE tool {spec.name!r} must declare an explicit "
+                "confirmation_phrase"
+            )
         self._tools[spec.name] = spec
 
     def get(self, name: str) -> ToolSpec | None:

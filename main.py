@@ -110,7 +110,7 @@ class RecognitionTrust:
         if recognized and confidence >= CONFIDENCE_RECOGNIZED:
             # Genuinely confident hit: renew the trust window and keep who
             # it matched.
-            self.last_strong_at = time.time()
+            self.last_strong_at = time.monotonic()
             self._last_name = name
         elif confidence < CONFIDENCE_UNCERTAIN:
             # Confident non-match: someone who clearly isn't the owner just
@@ -132,10 +132,20 @@ class RecognitionTrust:
         stale trust earned earlier in the session."""
         return self._within(window_seconds)
 
+    def last_strong_recognition_time(self) -> float | None:
+        """Raw (monotonic) timestamp of the last strong recognition, or None.
+
+        Lets the policy engine compare it directly against a pending action's
+        ``created_at`` (also ``time.monotonic()``): genuinely NEW evidence —
+        a recognition that landed after the action was proposed — rather than
+        just recent trust from earlier in the session.
+        """
+        return self.last_strong_at
+
     def _within(self, window_seconds: float) -> bool:
         if self.last_strong_at is None:
             return False
-        return (time.time() - self.last_strong_at) <= window_seconds
+        return (time.monotonic() - self.last_strong_at) <= window_seconds
 
     def reset(self) -> None:
         self.last_strong_at = None
@@ -188,7 +198,15 @@ async def run():
         return owner[0]
 
     is_bootstrap: list[bool] = [not voice_store.list_profiles()]
-    memory_context = build_context_summary(get_owner_name() or "")
+
+    # No owner yet on a truly fresh clone: get_owner_name() is None. The
+    # memory stores validate the owner name and reject "", so don't attempt
+    # any memory construction before an owner exists - the context stays ""
+    # until bootstrap has claimed an owner and this boot has re-read it.
+    owner_name = get_owner_name()
+    memory_context = (
+        build_context_summary(owner_name) if owner_name is not None else ""
+    )
 
     # Recognition state driving the policy engine. The actor stays treated
     # as the owner for RECOGNITION_TRUST_WINDOW_SECONDS after the last
@@ -208,10 +226,11 @@ async def run():
     def get_recognized_name() -> str | None:
         return recognition_state.recognized_name()
 
-    # Confirmation needs fresher evidence than ordinary tool gating: a
-    # recognition within the (much shorter) confirmation window.
-    def get_freshly_recognized_name() -> bool:
-        return recognition_state.is_freshly_recognized(CONFIRMATION_TRUST_WINDOW_SECONDS)
+    # Confirmation demands genuinely NEW evidence: a strong recognition that
+    # landed AFTER the action was proposed (F-01), which the policy engine
+    # compares against the pending action's monotonic created_at timestamp.
+    def get_last_strong_recognition_time() -> float | None:
+        return recognition_state.last_strong_recognition_time()
 
     tool_registry = ToolRegistry()
     tool_registry.register(make_reenroll_voice_spec())
@@ -235,12 +254,15 @@ async def run():
     # Memory tools go through the exact same registry + PolicyEngine as
     # everything else: TRIVIAL tier, owner-only, confirmation-free (same
     # reasoning as the Spotify playback tools). Scoped by whatever name owns
-    # this Eden; with no owner yet (first-run bootstrap) there is no memory
-    # scope, and the tools are still registered (they simply won't pass the
-    # owner gate).
-    memory_scope = get_owner_name() or ""
-    for spec in make_memory_handlers(memory_scope):
-        tool_registry.register(spec)
+    # this Eden. On a fresh clone there is no owner yet (bootstrap hasn't
+    # run), and the memory stores validate the owner name against "" - so the
+    # tools simply aren't registered this boot. They come back automatically
+    # on the next restart once bootstrap has claimed an owner: the same
+    # graceful-degradation shape as Spotify/Calendar when not yet configured.
+    owner_name = get_owner_name()
+    if owner_name is not None:
+        for spec in make_memory_handlers(owner_name):
+            tool_registry.register(spec)
 
     # Spotify integration is optional at startup: without a stored refresh
     # token (or with VAULT_KEY/creds missing) we skip registering the tools
@@ -318,7 +340,7 @@ async def run():
         tool_registry,
         get_recognized_name,
         get_owner_name,
-        get_freshly_recognized_name,
+        get_last_strong_recognition_time,
         # Let the policy engine wait briefly for an in-flight recognition —
         # otherwise the very first command of a session is judged before the
         # utterance that carries it has been scored, and gets denied.
@@ -416,7 +438,12 @@ async def run():
                 else:
                     print(f"  Voice sample {check_count}/{target} captured (awaiting name).")
 
-        async def _on_enroll_complete(embeddings) -> None:
+        # Plain def, NOT async: the recognizer's _enroll_sync fires this from
+        # a worker thread (asyncio.to_thread) and never awaits it. The whole
+        # body is synchronous (save_enrollment, prints, play_chime) - declaring
+        # it async would discard the coroutine, dropping the enrollment
+        # completion entirely with only a "never awaited" warning.
+        def _on_enroll_complete(embeddings) -> None:
             raw_name = (enrolled_name[0] or "owner").strip()
             claimed = None
             last_error = None
@@ -455,9 +482,18 @@ async def run():
             print()
             audio.play_chime()
 
-        recognizer.collect_enrollment(
-            enroll_target[0], on_enrollment_sample, _on_enroll_complete
-        )
+        # Enrollment collection only ever runs during the first-run bootstrap.
+        # On a normal restart (owner already enrolled) running it here would put
+        # the recognizer into enroll mode, swallowing the first target-count of
+        # utterances as samples instead of scoring them - so a TRIVIAL command
+        # right after boot would be denied for several sentences. Guarding on
+        # is_bootstrap also confines _on_enroll_complete's "owner" fallback and
+        # owner assignment to genuine bootstrap, where enrolled_name[0] is
+        # always set by the "what should I call you" step first.
+        if is_bootstrap[0]:
+            recognizer.collect_enrollment(
+                enroll_target[0], on_enrollment_sample, _on_enroll_complete
+            )
 
         async def state_machine():
             while True:
